@@ -9,7 +9,9 @@
 //!
 //! A room casts only while something plays on its sink. When another sender
 //! takes the device, the room yields and does not take it back until its own
-//! audio stops and starts again.
+//! audio stops and starts again, or until a client asks to resume.
+//!
+//! Every change of state is published to [`Shared`] for desktop widgets.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -23,6 +25,7 @@ use serde_json::json;
 use crate::castv2::{self, Connection, Message};
 use crate::discovery::Device;
 use crate::sink;
+use crate::status::{Level, Phase as Shown, Shared};
 
 /// The default media receiver application.
 const APP_ID: &str = "CC1AD845";
@@ -51,6 +54,8 @@ pub enum Control {
     Volume { level: f32, muted: bool },
     /// Discovery saw the device again, maybe at a new address.
     Device(Device),
+    /// Take the device back from another sender.
+    Resume,
     Shutdown,
 }
 
@@ -102,6 +107,14 @@ pub struct Room {
     cast: bool,
     /// True while a Cast session is open. Read by the manager.
     busy: Arc<AtomicBool>,
+    shared: Arc<Shared>,
+    /// The player state the device last reported in this session.
+    player: Shown,
+    /// The other application that last ran on the device, by display name.
+    other_app: Option<String>,
+    /// Set when another sender took the device. Cleared when the sink goes
+    /// idle or a client asks to resume.
+    yielded: bool,
     active: bool,
     idle_since: Option<Instant>,
     backoff: Duration,
@@ -114,6 +127,7 @@ impl Room {
         control: Receiver<Control>,
         sinks: pipewire::channel::Sender<sink::Command>,
         busy: Arc<AtomicBool>,
+        shared: Arc<Shared>,
         cast: bool,
     ) -> Self {
         Self {
@@ -126,6 +140,10 @@ impl Room {
             volume_sent: Instant::now(),
             cast,
             busy,
+            shared,
+            player: Shown::Loading,
+            other_app: None,
+            yielded: false,
             active: false,
             idle_since: None,
             backoff: BACKOFF_MIN,
@@ -134,16 +152,18 @@ impl Room {
 
     /// Runs until shutdown.
     pub fn run(mut self) {
-        let mut yielded = false;
         loop {
             // Wait for audio. A yielded room also waits for the audio to stop first.
-            while !self.active || yielded || !self.cast {
+            while !self.active || self.yielded || !self.cast {
+                if self.yielded {
+                    let app = self.other_app.clone().unwrap_or_default();
+                    self.show(Shown::Busy, &app, None);
+                } else {
+                    self.show(Shown::Ready, "", None);
+                }
                 match self.control.recv() {
                     Ok(Control::Shutdown) | Err(_) => return,
                     Ok(control) => self.apply(control),
-                }
-                if !self.active {
-                    yielded = false;
                 }
             }
 
@@ -153,13 +173,24 @@ impl Room {
 
             match outcome {
                 Ok(End::Shutdown) => return,
-                Ok(End::Idle) => self.log("idle, session closed"),
+                Ok(End::Idle) => {
+                    self.log("idle, session closed");
+                    self.event(Level::Info, "idle_stop", json!({ "seconds": GRACE.as_secs() }));
+                }
                 Ok(End::Yielded) => {
                     self.log("device taken by another sender, yielding");
-                    yielded = true;
+                    self.event(Level::Warning, "yielded", json!({ "app": self.other_app }));
+                    self.yielded = true;
                 }
                 Err(error) => {
-                    self.log(&format!("{error:#}, retry in {:?}", self.backoff));
+                    let text = format!("{error:#}");
+                    self.log(&format!("{text}, retry in {:?}", self.backoff));
+                    self.event(
+                        Level::Warning,
+                        "error",
+                        json!({ "error": text, "retry": self.backoff.as_secs() }),
+                    );
+                    self.show(Shown::Restarting, &text, Some(self.backoff));
                     if !self.wait(self.backoff) {
                         return;
                     }
@@ -167,6 +198,28 @@ impl Room {
                 }
             }
         }
+    }
+
+    fn show(&self, phase: Shown, reason: &str, deadline: Option<Duration>) {
+        self.shared.set_phase(&self.device.key, phase, reason, deadline);
+    }
+
+    fn event(&self, level: Level, code: &str, args: serde_json::Value) {
+        self.shared.event(level, code, Some(&self.device.key), args);
+    }
+
+    /// Publishes the state of the open session.
+    fn show_session(&self, phase: &Phase) {
+        if let Some(since) = self.idle_since {
+            self.show(Shown::Lingering, "", Some(GRACE.saturating_sub(since.elapsed())));
+            return;
+        }
+        let shown = match phase {
+            Phase::Launching { .. } => Shown::Launching,
+            Phase::Loading { .. } => Shown::Loading,
+            Phase::Playing { .. } => self.player,
+        };
+        self.show(shown, "", None);
     }
 
     fn log(&self, text: &str) {
@@ -178,11 +231,20 @@ impl Room {
             Control::Active(active) => {
                 self.active = active;
                 self.idle_since = (!active).then(Instant::now);
+                if !active {
+                    self.yielded = false;
+                }
             }
             Control::Volume { level, muted } => {
                 self.volume = Volume { level: level.clamp(0.0, 1.0), muted };
             }
             Control::Device(device) => self.device = device,
+            Control::Resume => {
+                if self.yielded {
+                    self.event(Level::Info, "resumed", json!({}));
+                }
+                self.yielded = false;
+            }
             Control::Shutdown => {}
         }
     }
@@ -211,6 +273,7 @@ impl Room {
             )?;
         }
         self.log(&format!("volume to device: {}", self.volume));
+        self.shared.set_volume(&self.device.key, self.volume.level, self.volume.muted);
         self.device_volume = Some(self.volume);
         self.volume_sent = Instant::now();
         Ok(())
@@ -227,6 +290,7 @@ impl Room {
         }
         let reported = Volume { level: level as f32, muted };
         self.device_volume = Some(reported);
+        self.shared.set_volume(&self.device.key, reported.level, reported.muted);
         if !self.volume.same_as(reported) {
             self.log(&format!("volume from device: {reported}"));
             self.volume = reported;
@@ -260,6 +324,9 @@ impl Room {
             self.device.key
         );
         self.log(&format!("connecting to {}", self.device.address));
+        self.show(Shown::Connecting, "", None);
+        self.player = Shown::Loading;
+        self.other_app = None;
         let mut cast = Connection::open(self.device.address)?;
         cast.connect(castv2::RECEIVER)?;
         let request = cast.request(
@@ -296,8 +363,15 @@ impl Room {
             }
             if !matches!(phase, Phase::Playing { .. }) && started.elapsed() > SETUP_TIMEOUT {
                 stop(&mut cast, &phase);
+                if matches!(phase, Phase::Loading { .. }) && self.shared.listeners(&self.device.key) == 0
+                {
+                    // The device never fetched the stream: most likely a firewall.
+                    self.event(Level::Error, "not_fetched", json!({ "port": self.port }));
+                    bail!("the device did not fetch the stream");
+                }
                 bail!("playback did not start");
             }
+            self.show_session(&phase);
             self.push_volume(&mut cast)?;
             if last_ping.elapsed() > PING_EVERY {
                 cast.send(castv2::NS_HEARTBEAT, castv2::RECEIVER, &json!({ "type": "PING" }))?;
@@ -340,6 +414,11 @@ impl Room {
                 self.pull_volume(&payload["status"]["volume"]);
                 let apps = payload["status"]["applications"].as_array();
                 let apps = apps.map(Vec::as_slice).unwrap_or_default();
+                if let Some(other) = apps.iter().find(|app| app["appId"] != APP_ID)
+                    && let Some(name) = other["displayName"].as_str()
+                {
+                    self.other_app = Some(name.to_string());
+                }
                 match phase {
                     Phase::Launching { request } => {
                         let ours = apps.iter().find(|app| app["appId"] == APP_ID);
@@ -385,9 +464,15 @@ impl Room {
             (castv2::NS_MEDIA, "MEDIA_STATUS") => {
                 let status = &payload["status"][0];
                 match status["playerState"].as_str() {
+                    Some(state @ ("BUFFERING" | "PAUSED")) => {
+                        self.player =
+                            if state == "PAUSED" { Shown::Paused } else { Shown::Buffering };
+                    }
                     Some("PLAYING") => {
+                        self.player = Shown::Playing;
                         if let Phase::Loading { transport, session } = phase {
                             self.log("playing");
+                            self.event(Level::Info, "playing", json!({}));
                             self.backoff = BACKOFF_MIN;
                             *phase = Phase::Playing {
                                 transport: std::mem::take(transport),

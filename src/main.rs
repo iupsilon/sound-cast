@@ -6,6 +6,7 @@ mod http;
 mod hub;
 mod room;
 mod sink;
+mod status;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +21,8 @@ use pipewire as pw;
 use discovery::Device;
 use hub::Hub;
 use room::{Control, Room};
+use serde_json::json;
+use status::{Level, Shared};
 
 const USAGE: &str = "\
 usage: sound-cast [--port PORT] [--only NAME]... [--no-cast]
@@ -36,6 +39,8 @@ pub enum Event {
     Found(Device),
     /// The device with this key left the network.
     Lost(String),
+    /// A client asked the room with this key to take its device back.
+    Resume(String),
     Shutdown,
 }
 
@@ -54,6 +59,7 @@ struct Manager {
     cast: bool,
     hubs: http::Hubs,
     sinks: pw::channel::Sender<sink::Command>,
+    shared: Arc<Shared>,
     rooms: HashMap<String, RoomHandle>,
 }
 
@@ -63,8 +69,17 @@ impl Manager {
             match events.recv_timeout(SWEEP_EVERY) {
                 Ok(Event::Found(device)) => self.found(device),
                 Ok(Event::Lost(key)) => {
-                    if let Some(room) = self.rooms.get_mut(&key) {
+                    if let Some(room) = self.rooms.get_mut(&key)
+                        && room.lost_at.is_none()
+                    {
                         room.lost_at = Some(Instant::now());
+                        self.shared.set_lost(&key, Some(LOST_GRACE));
+                        self.shared.event(Level::Warning, "lost", Some(&key), json!({}));
+                    }
+                }
+                Ok(Event::Resume(key)) => {
+                    if let Some(room) = self.rooms.get(&key) {
+                        let _ = room.control.send(Control::Resume);
                     }
                 }
                 Ok(Event::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
@@ -87,7 +102,10 @@ impl Manager {
             return;
         }
         if let Some(room) = self.rooms.get_mut(&device.key) {
-            room.lost_at = None;
+            if room.lost_at.take().is_some() {
+                self.shared.set_lost(&device.key, None);
+                self.shared.event(Level::Info, "back", Some(&device.key), json!({}));
+            }
             let _ = room.control.send(Control::Device(device));
             return;
         }
@@ -113,7 +131,17 @@ impl Manager {
             control: control_tx.clone(),
         });
         let key = device.key.clone();
-        let room = Room::new(device, self.port, control_rx, self.sinks.clone(), busy.clone(), self.cast);
+        self.shared.add_room(&key, &device.name, &node_name);
+        self.shared.event(Level::Info, "found", Some(&key), json!({}));
+        let room = Room::new(
+            device,
+            self.port,
+            control_rx,
+            self.sinks.clone(),
+            busy.clone(),
+            self.shared.clone(),
+            self.cast,
+        );
         self.rooms.insert(
             key,
             RoomHandle {
@@ -139,6 +167,7 @@ impl Manager {
             .map(|(key, _)| key.clone())
             .collect();
         for key in gone {
+            self.shared.event(Level::Warning, "removed", Some(&key), json!({}));
             self.remove(&key);
         }
     }
@@ -152,6 +181,7 @@ impl Manager {
         let _ = room.thread.join();
         let _ = self.sinks.send(sink::Command::Remove { key: key.to_string() });
         self.hubs.lock().unwrap().remove(key);
+        self.shared.remove_room(key);
         room.hub.close();
     }
 }
@@ -205,12 +235,19 @@ fn main() -> Result<()> {
 
     block_termination_signals();
 
+    let shared = Shared::new(port);
     let hubs = http::Hubs::default();
-    http::start(port, hubs.clone())?;
+    http::start(port, hubs.clone(), shared.clone())?;
 
     let (events_tx, events_rx) = channel();
+    // Once the name is owned, systemd (Type=dbus) considers the service started.
+    if let Err(error) = status::start(shared.clone(), events_tx.clone()) {
+        eprintln!("status: {error:#}; running without the D-Bus interface");
+    }
+    shared.event(Level::Info, "started", None, json!({ "port": port }));
     let (sinks_tx, sinks_rx) = pw::channel::channel();
-    let manager = Manager { port, only, cast, hubs, sinks: sinks_tx, rooms: HashMap::new() };
+    let manager =
+        Manager { port, only, cast, hubs, sinks: sinks_tx, shared, rooms: HashMap::new() };
     let manager = thread::spawn(move || manager.run(events_rx));
     {
         let events = events_tx.clone();

@@ -41,7 +41,36 @@ Options:
 - `--no-cast`: create the sinks and serve the streams, but never play on a
   device. For tests.
 
+## Service
+
+```sh
+cargo install --path .
+cp sound-cast.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now sound-cast
+journalctl --user -u sound-cast -f     # the log
+```
+
+## D-Bus interface
+
+On the session bus: service `org.soundcast.Daemon`, object `/org/soundcast/Daemon`,
+interface `org.soundcast.Daemon1`. The
+[Plasma widget](https://github.com/iupsilon/plasma-applet-sound-cast) uses it.
+
+- `Status` (property, JSON string): `{"now", "port", "devices": [...]}`. Each device has
+  `key`, `friendly_name`, `sink_name`, `phase`, `reason`, `since`, `deadline`,
+  `lost_until`, `listeners` (open stream connections), `buffering_last_minute`,
+  `volume` (0-100 or null) and `muted`. Times are Unix seconds.
+- Phases: `ready`, `connecting`, `launching`, `loading`, `playing`, `buffering`,
+  `paused`, `lingering` (no audio, stops at `deadline`), `restarting` (after an
+  error, retries at `deadline`), `busy` (another app took the device; `reason` is
+  its name).
+- `Events` (property, JSON string): the last 50 events, each
+  `{"ts", "level", "code", "sink_name", "args"}`.
+- `Resume(s sink_name)` (method): take a device back from the app that took it.
+
+Both properties send `PropertiesChanged`, at most every 100 ms: nothing needs polling.
+
 ## Status
 
-Early. Missing: a control interface for a
-desktop widget, compressed audio (FLAC), a systemd unit and packaging.
+Early. Missing: compressed audio (FLAC) and packaging.

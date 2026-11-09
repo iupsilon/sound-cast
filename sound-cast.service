@@ -1,0 +1,17 @@
+[Unit]
+Description=Play desktop audio on Chromecast speakers
+Documentation=https://github.com/iupsilon/sound-cast
+After=pipewire.service pipewire-pulse.service
+Wants=pipewire.service
+
+[Service]
+# Started once it owns its D-Bus name.
+Type=dbus
+BusName=org.soundcast.Daemon
+# Installed with: cargo install --path .
+ExecStart=%h/.cargo/bin/sound-cast
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

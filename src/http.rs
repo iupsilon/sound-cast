@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::hub::{BYTES_PER_FRAME, CHANNELS, Hub, RATE};
+use crate::status::Shared;
 
 /// The hub of every room, by room key.
 pub type Hubs = Arc<Mutex<HashMap<String, Arc<Hub>>>>;
@@ -34,7 +35,7 @@ fn wav_header() -> [u8; 44] {
     h
 }
 
-fn handle(mut socket: TcpStream, hubs: &Hubs) -> std::io::Result<()> {
+fn handle(mut socket: TcpStream, hubs: &Hubs, shared: &Shared) -> std::io::Result<()> {
     socket.set_read_timeout(Some(Duration::from_secs(5)))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
     socket.set_nodelay(true)?;
@@ -51,11 +52,9 @@ fn handle(mut socket: TcpStream, hubs: &Hubs) -> std::io::Result<()> {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
-    let hub = path
-        .strip_prefix("/stream/")
-        .filter(|_| method == "GET" || method == "HEAD")
-        .and_then(|key| hubs.lock().unwrap().get(key).cloned());
-    let Some(hub) = hub else {
+    let key = path.strip_prefix("/stream/").filter(|_| method == "GET" || method == "HEAD");
+    let Some((key, hub)) = key.and_then(|k| Some((k, hubs.lock().unwrap().get(k).cloned()?)))
+    else {
         return socket.write_all(NOT_FOUND);
     };
 
@@ -73,24 +72,30 @@ fn handle(mut socket: TcpStream, hubs: &Hubs) -> std::io::Result<()> {
     let Some(chunks) = chunks else {
         return Ok(());
     };
-    socket.write_all(&wav_header())?;
-    for chunk in chunks {
-        socket.write_all(&chunk)?;
-    }
-    Ok(())
+    shared.listener(key, 1);
+    let result = (|| {
+        socket.write_all(&wav_header())?;
+        for chunk in chunks {
+            socket.write_all(&chunk)?;
+        }
+        Ok(())
+    })();
+    shared.listener(key, -1);
+    result
 }
 
 /// Binds the port, then serves clients on a background thread each.
-pub fn start(port: u16, hubs: Hubs) -> Result<()> {
+pub fn start(port: u16, hubs: Hubs, shared: Arc<Shared>) -> Result<()> {
     let listener =
         TcpListener::bind(("0.0.0.0", port)).with_context(|| format!("bind TCP port {port}"))?;
     thread::spawn(move || {
         for socket in listener.incoming().flatten() {
             let hubs = hubs.clone();
+            let shared = shared.clone();
             thread::spawn(move || {
                 let peer = socket.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
                 eprintln!("http: {peer} connected");
-                match handle(socket, &hubs) {
+                match handle(socket, &hubs, &shared) {
                     Ok(()) => eprintln!("http: {peer} closed"),
                     Err(error) => eprintln!("http: {peer} closed ({error})"),
                 }
