@@ -10,6 +10,8 @@ depends=(gcc-libs glibc libpipewire pipewire)
 makedepends=(cargo clang git)
 source=("sound-cast::git+file:///home/yari/Repository/sound-cast")
 sha256sums=(SKIP)
+# GCC LTO objects from ring's C code cannot be linked by rustc's linker.
+options=(!lto)
 
 pkgver() {
   cd sound-cast
@@ -26,6 +28,12 @@ prepare() {
 
 build() {
   cd sound-cast
+  # The package goes to other machines: no code tuned for this CPU (CachyOS
+  # sets -march=native and target-cpu=native).
+  CFLAGS=${CFLAGS//-march=native/-march=x86-64}; CFLAGS=${CFLAGS//-mtune=native/-mtune=generic}
+  CXXFLAGS=${CXXFLAGS//-march=native/-march=x86-64}; CXXFLAGS=${CXXFLAGS//-mtune=native/-mtune=generic}
+  RUSTFLAGS=${RUSTFLAGS//target-cpu=native/target-cpu=x86-64}
+  export CFLAGS CXXFLAGS RUSTFLAGS
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release
