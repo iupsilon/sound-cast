@@ -101,19 +101,22 @@ impl Hub {
             let received = if !self.has_clients() {
                 // Nobody listens: sleep until audio or a new client arrives.
                 idle = false;
-                captured.recv().map_err(|_| RecvTimeoutError::Disconnected)
+                let received = captured.recv().map_err(|_| RecvTimeoutError::Disconnected);
+                // Nobody heard the time spent asleep: the silence clock starts now.
+                last_audio = Instant::now();
+                received
             } else if idle {
                 captured.recv_timeout(next_silence.saturating_duration_since(Instant::now()))
             } else {
                 captured.recv_timeout(IDLE_AFTER)
             };
             match received {
+                // A wake-up, not audio: the silence keeps its pace.
+                Ok(pcm) if pcm.is_empty() => {}
                 Ok(pcm) => {
                     idle = false;
                     last_audio = Instant::now();
-                    if !pcm.is_empty() {
-                        self.publish(pcm.into());
-                    }
+                    self.publish(pcm.into());
                 }
                 Err(RecvTimeoutError::Timeout) if !idle => {
                     // Cover the gap since the last real chunk, then tick.

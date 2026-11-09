@@ -103,14 +103,15 @@ impl Tap {
     /// Follows whether the float samples of one cycle carry sound.
     fn watch_level(&self, samples: &[u8]) {
         let gain = f32::from_bits(self.gain.load(Ordering::Relaxed));
-        // Muted, the samples are zero whatever plays: keep the current state.
-        if self.muted.load(Ordering::Relaxed) || gain < MIN_GAIN {
-            return;
-        }
+        // Muted, the samples are zero whatever plays, and nothing reaches the
+        // device either: count it as silence, so a muted sink that keeps
+        // running (a level meter on its monitor) does not hold a session open.
+        let audible = !self.muted.load(Ordering::Relaxed) && gain >= MIN_GAIN;
         let threshold = SOUND_LEVEL * gain;
-        let loud = samples.chunks_exact(4).any(|sample| {
-            f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]).abs() > threshold
-        });
+        let loud = audible
+            && samples.chunks_exact(4).any(|sample| {
+                f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]).abs() > threshold
+            });
         if loud {
             self.silent_frames.store(0, Ordering::Relaxed);
             self.set_sounding(true);
@@ -305,4 +306,28 @@ fn create(core: &CoreRc, node_name: &str, description: &str, tap: Tap) -> Result
         .context("connect stream")?;
 
     Ok(Sink { _listener: listener, stream })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::{channel, sync_channel};
+
+    fn cycle(value: f32, frames: usize) -> Vec<u8> {
+        value.to_le_bytes().repeat(frames * CHANNELS as usize)
+    }
+
+    #[test]
+    fn muted_sink_goes_inactive() {
+        let (captured, _audio) = sync_channel(1);
+        let (control, controls) = channel();
+        let tap = Tap::new(captured, control);
+
+        tap.watch_level(&cycle(0.5, 1024));
+        assert!(matches!(controls.try_recv(), Ok(Control::Active(true))));
+
+        tap.muted.store(true, Ordering::Relaxed);
+        tap.watch_level(&cycle(0.0, SILENCE_FRAMES as usize));
+        assert!(matches!(controls.try_recv(), Ok(Control::Active(false))));
+    }
 }
