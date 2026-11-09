@@ -1,0 +1,236 @@
+//! sound-cast: play PipeWire audio on Chromecast speakers, one sink per room.
+
+mod castv2;
+mod discovery;
+mod http;
+mod hub;
+mod room;
+mod sink;
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use anyhow::{Result, anyhow, bail};
+use pipewire as pw;
+
+use discovery::Device;
+use hub::Hub;
+use room::{Control, Room};
+
+const USAGE: &str = "\
+usage: sound-cast [--port PORT] [--only NAME]...
+
+  --port PORT   TCP port of the audio streams (default 3000)
+  --only NAME   create a sink only for this Cast device or group (repeatable)";
+
+/// A device missing from the network for this long loses its sink.
+const LOST_GRACE: Duration = Duration::from_secs(60);
+const SWEEP_EVERY: Duration = Duration::from_secs(10);
+
+pub enum Event {
+    Found(Device),
+    /// The device with this key left the network.
+    Lost(String),
+    Shutdown,
+}
+
+struct RoomHandle {
+    name: String,
+    control: Sender<Control>,
+    hub: Arc<Hub>,
+    busy: Arc<AtomicBool>,
+    lost_at: Option<Instant>,
+    thread: JoinHandle<()>,
+}
+
+struct Manager {
+    port: u16,
+    only: Vec<String>,
+    hubs: http::Hubs,
+    sinks: pw::channel::Sender<sink::Command>,
+    rooms: HashMap<String, RoomHandle>,
+}
+
+impl Manager {
+    fn run(mut self, events: Receiver<Event>) {
+        loop {
+            match events.recv_timeout(SWEEP_EVERY) {
+                Ok(Event::Found(device)) => self.found(device),
+                Ok(Event::Lost(key)) => {
+                    if let Some(room) = self.rooms.get_mut(&key) {
+                        room.lost_at = Some(Instant::now());
+                    }
+                }
+                Ok(Event::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            self.sweep();
+        }
+        // Every room stops its receiver application before the process exits.
+        let keys: Vec<String> = self.rooms.keys().cloned().collect();
+        for room in self.rooms.values() {
+            let _ = room.control.send(Control::Shutdown);
+        }
+        for key in keys {
+            self.remove(&key);
+        }
+    }
+
+    fn found(&mut self, device: Device) {
+        if !self.only.is_empty() && !self.only.iter().any(|n| n.eq_ignore_ascii_case(&device.name)) {
+            return;
+        }
+        if let Some(room) = self.rooms.get_mut(&device.key) {
+            room.lost_at = None;
+            let _ = room.control.send(Control::Device(device));
+            return;
+        }
+
+        let mut node_name = format!("sound-cast.{}", slug(&device.name));
+        if self.rooms.values().any(|r| r.name == node_name) {
+            node_name = format!("{node_name}.{:.6}", device.key);
+        }
+        eprintln!("{}: found at {}, sink {node_name}", device.name, device.address);
+
+        let (hub, captured) = Hub::start();
+        let (control_tx, control_rx) = channel();
+        let busy = Arc::new(AtomicBool::new(false));
+        self.hubs.lock().unwrap().insert(device.key.clone(), hub.clone());
+        let _ = self.sinks.send(sink::Command::Add {
+            key: device.key.clone(),
+            node_name: node_name.clone(),
+            description: device.name.clone(),
+            captured,
+            control: control_tx.clone(),
+        });
+        let key = device.key.clone();
+        let room = Room::new(device, self.port, control_rx, busy.clone());
+        self.rooms.insert(
+            key,
+            RoomHandle {
+                name: node_name,
+                control: control_tx,
+                hub,
+                busy,
+                lost_at: None,
+                thread: thread::spawn(move || room.run()),
+            },
+        );
+    }
+
+    /// Removes the rooms whose device is long gone and that are not casting.
+    fn sweep(&mut self) {
+        let gone: Vec<String> = self
+            .rooms
+            .iter()
+            .filter(|(_, room)| {
+                room.lost_at.is_some_and(|at| at.elapsed() > LOST_GRACE)
+                    && !room.busy.load(Ordering::Acquire)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in gone {
+            self.remove(&key);
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        let Some(room) = self.rooms.remove(key) else {
+            return;
+        };
+        eprintln!("{}: removed", room.name);
+        let _ = room.control.send(Control::Shutdown);
+        let _ = room.thread.join();
+        let _ = self.sinks.send(sink::Command::Remove { key: key.to_string() });
+        self.hubs.lock().unwrap().remove(key);
+        room.hub.close();
+    }
+}
+
+/// Lowercase ASCII letters and digits, everything else folded into `_`.
+fn slug(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('_') && !out.is_empty() {
+            out.push('_');
+        }
+    }
+    out.trim_end_matches('_').to_string()
+}
+
+/// Blocks SIGINT and SIGTERM in this thread and in every thread spawned after
+/// it. The PipeWire loop reads them through a signalfd, which sees a signal
+/// only when no thread takes it the default way.
+fn block_termination_signals() {
+    // SAFETY: the set is initialised by `sigemptyset` before use, and the calls
+    // only change the signal mask of the calling thread.
+    unsafe {
+        let mut set = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+fn main() -> Result<()> {
+    let mut port = 3000u16;
+    let mut only = Vec::new();
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--port" => port = args.next().ok_or(anyhow!("--port needs a value"))?.parse()?,
+            "--only" => only.push(args.next().ok_or(anyhow!("--only needs a name"))?),
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            other => bail!("unknown argument {other}\n{USAGE}"),
+        }
+    }
+
+    block_termination_signals();
+
+    let hubs = http::Hubs::default();
+    http::start(port, hubs.clone())?;
+
+    let (events_tx, events_rx) = channel();
+    let (sinks_tx, sinks_rx) = pw::channel::channel();
+    let manager = Manager { port, only, hubs, sinks: sinks_tx, rooms: HashMap::new() };
+    let manager = thread::spawn(move || manager.run(events_rx));
+    {
+        let events = events_tx.clone();
+        thread::spawn(move || {
+            if let Err(error) = discovery::run(events) {
+                eprintln!("discovery: {error:#}");
+                std::process::exit(1);
+            }
+        });
+    }
+
+    // Blocks until SIGINT or SIGTERM.
+    let result = sink::run(sinks_rx);
+
+    let _ = events_tx.send(Event::Shutdown);
+    let _ = manager.join();
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slug;
+
+    #[test]
+    fn slug_keeps_letters_and_digits() {
+        assert_eq!(slug("Sala"), "sala");
+        assert_eq!(slug("Casse  Camera 2!"), "casse_camera_2");
+        assert_eq!(slug("  Però"), "per");
+    }
+}
