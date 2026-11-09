@@ -6,6 +6,8 @@
 //! - property `Status` (s): JSON snapshot of every room, see [`Shared::status_json`].
 //! - property `Events` (s): JSON array of the last [`MAX_EVENTS`] events.
 //! - method `Resume(s sink_name)`: take back a device another sender took.
+//! - method `Stop(s sink_name)`: end now a session that is only waiting out
+//!   its grace period (no audio on the sink).
 //!
 //! Both properties announce their changes with `PropertiesChanged`, at most
 //! every [`COALESCE`]. Times are Unix seconds; `now` in `Status` lets a client
@@ -329,6 +331,17 @@ impl Daemon {
             .ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("no sink {sink_name}")))?;
         self.events
             .send(Event::Resume(key))
+            .map_err(|_| zbus::fdo::Error::Failed("shutting down".into()))
+    }
+
+    /// Ends now a session that has no audio and waits out its grace period.
+    fn stop(&self, sink_name: &str) -> zbus::fdo::Result<()> {
+        let key = self
+            .shared
+            .key_of_sink(sink_name)
+            .ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("no sink {sink_name}")))?;
+        self.events
+            .send(Event::Stop(key))
             .map_err(|_| zbus::fdo::Error::Failed("shutting down".into()))
     }
 }

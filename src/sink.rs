@@ -9,12 +9,17 @@
 //! samples, so the process callback divides that gain out again. The samples
 //! are taken as 32-bit float to make this lossless.
 //!
+//! A sink counts as active only while sound arrives in it. PipeWire also runs
+//! a sink that nothing plays into, for example when a desktop volume applet
+//! records its monitor for a level meter: that must not cast silence to every
+//! room.
+//!
 //! PipeWire objects belong to the loop thread. Other threads ask for sinks
 //! through [`Command`]s.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, SyncSender};
 
 use anyhow::{Context, Result};
@@ -54,6 +59,10 @@ pub enum Command {
 
 /// Below this linear gain the audio is treated as silence.
 const MIN_GAIN: f32 = 1e-6;
+/// A sample above this level, before the sink volume, is sound (-80 dBFS).
+const SOUND_LEVEL: f32 = 1e-4;
+/// Silence for this many frames makes the sink inactive.
+const SILENCE_FRAMES: u64 = 3 * RATE as u64;
 
 /// What the callbacks of one sink need. The process callback runs on the
 /// realtime thread and the others on the loop thread, so the shared values
@@ -66,6 +75,10 @@ struct Tap {
     /// Gain the process callback saw in its previous cycle, as `f32` bits.
     previous_gain: AtomicU32,
     muted: AtomicBool,
+    /// True while sound arrives. Changes are sent as [`Control::Active`].
+    sounding: AtomicBool,
+    /// Frames of silence since the last sound.
+    silent_frames: AtomicU64,
 }
 
 impl Tap {
@@ -76,6 +89,37 @@ impl Tap {
             gain: AtomicU32::new(1f32.to_bits()),
             previous_gain: AtomicU32::new(1f32.to_bits()),
             muted: AtomicBool::new(false),
+            sounding: AtomicBool::new(false),
+            silent_frames: AtomicU64::new(0),
+        }
+    }
+
+    fn set_sounding(&self, sounding: bool) {
+        if self.sounding.swap(sounding, Ordering::Relaxed) != sounding {
+            let _ = self.control.send(Control::Active(sounding));
+        }
+    }
+
+    /// Follows whether the float samples of one cycle carry sound.
+    fn watch_level(&self, samples: &[u8]) {
+        let gain = f32::from_bits(self.gain.load(Ordering::Relaxed));
+        // Muted, the samples are zero whatever plays: keep the current state.
+        if self.muted.load(Ordering::Relaxed) || gain < MIN_GAIN {
+            return;
+        }
+        let threshold = SOUND_LEVEL * gain;
+        let loud = samples.chunks_exact(4).any(|sample| {
+            f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]).abs() > threshold
+        });
+        if loud {
+            self.silent_frames.store(0, Ordering::Relaxed);
+            self.set_sounding(true);
+        } else {
+            let frames = (samples.len() / (4 * CHANNELS as usize)) as u64;
+            let silent = self.silent_frames.fetch_add(frames, Ordering::Relaxed) + frames;
+            if silent >= SILENCE_FRAMES {
+                self.set_sounding(false);
+            }
         }
     }
 
@@ -173,11 +217,10 @@ fn create(core: &CoreRc, node_name: &str, description: &str, tap: Tap) -> Result
 
     let listener = stream
         .add_local_listener_with_user_data(tap)
-        .state_changed(|_, tap, old, new| {
-            let was = matches!(old, StreamState::Streaming);
-            let is = matches!(new, StreamState::Streaming);
-            if was != is {
-                let _ = tap.control.send(Control::Active(is));
+        .state_changed(|_, tap, _, new| {
+            // Starting to stream is not enough: sound must arrive (see watch_level).
+            if !matches!(new, StreamState::Streaming) {
+                tap.set_sounding(false);
             }
         })
         .control_info(|_, tap, id, control| {
@@ -219,6 +262,7 @@ fn create(core: &CoreRc, node_name: &str, description: &str, tap: Tap) -> Result
                 && let Some(samples) = bytes.get(offset..offset + size)
                 && !samples.is_empty()
             {
+                tap.watch_level(samples);
                 // Never block the realtime thread: a full queue drops the chunk.
                 let _ = tap.captured.try_send(tap.to_pcm(samples));
             }

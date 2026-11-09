@@ -68,6 +68,8 @@ interface `org.soundcast.Daemon1`. The
 - `Events` (property, JSON string): the last 50 events, each
   `{"ts", "level", "code", "sink_name", "args"}`.
 - `Resume(s sink_name)` (method): take a device back from the app that took it.
+- `Stop(s sink_name)` (method): end now a session that has no audio and is waiting
+  out its 20 s grace period.
 
 Both properties send `PropertiesChanged`, at most every 100 ms: nothing needs polling.
 

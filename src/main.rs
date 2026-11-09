@@ -41,6 +41,8 @@ pub enum Event {
     Lost(String),
     /// A client asked the room with this key to take its device back.
     Resume(String),
+    /// A client asked the room with this key to end its idle session now.
+    Stop(String),
     Shutdown,
 }
 
@@ -80,6 +82,11 @@ impl Manager {
                 Ok(Event::Resume(key)) => {
                     if let Some(room) = self.rooms.get(&key) {
                         let _ = room.control.send(Control::Resume);
+                    }
+                }
+                Ok(Event::Stop(key)) => {
+                    if let Some(room) = self.rooms.get(&key) {
+                        let _ = room.control.send(Control::Stop);
                     }
                 }
                 Ok(Event::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,

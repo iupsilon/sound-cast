@@ -60,6 +60,8 @@ pub enum Control {
     Device(Device),
     /// Take the device back from another sender.
     Resume,
+    /// End the session now if the sink has no audio, without waiting out GRACE.
+    Stop,
     Shutdown,
 }
 
@@ -69,6 +71,8 @@ enum End {
     Idle,
     /// Another sender took the device, or the user stopped playback there.
     Yielded,
+    /// A client asked to end the idle session early.
+    Stopped,
     Shutdown,
 }
 
@@ -120,6 +124,8 @@ pub struct Room {
     /// idle or a client asks to resume.
     yielded: bool,
     active: bool,
+    /// A client asked to end the idle session. Ignored while audio plays.
+    stop_requested: bool,
     idle_since: Option<Instant>,
     backoff: Duration,
 }
@@ -149,6 +155,7 @@ impl Room {
             other_app: None,
             yielded: false,
             active: false,
+            stop_requested: false,
             idle_since: None,
             backoff: BACKOFF_MIN,
         }
@@ -184,6 +191,10 @@ impl Room {
 
             match outcome {
                 Ok(End::Shutdown) => return,
+                Ok(End::Stopped) => {
+                    self.log("stopped on request, session closed");
+                    self.event(Level::Info, "stopped", json!({}));
+                }
                 Ok(End::Idle) => {
                     self.log("idle, session closed");
                     self.event(Level::Info, "idle_stop", json!({ "seconds": GRACE.as_secs() }));
@@ -247,7 +258,9 @@ impl Room {
             Control::Active(active) => {
                 self.active = active;
                 self.idle_since = (!active).then(Instant::now);
-                if !active {
+                if active {
+                    self.stop_requested = false;
+                } else {
                     self.yielded = false;
                 }
             }
@@ -261,6 +274,7 @@ impl Room {
                 }
                 self.yielded = false;
             }
+            Control::Stop => self.stop_requested = !self.active,
             Control::Shutdown => {}
         }
     }
@@ -343,6 +357,7 @@ impl Room {
         self.show(Shown::Connecting, "", None);
         self.player = Shown::Loading;
         self.other_app = None;
+        self.stop_requested = false;
         let mut cast = Connection::open(self.device.address)?;
         cast.connect(castv2::RECEIVER)?;
         let request = cast.request(
@@ -369,6 +384,10 @@ impl Room {
                     Ok(control) => self.apply(control),
                     Err(TryRecvError::Empty) => break,
                 }
+            }
+            if self.stop_requested && !self.active {
+                stop(&mut cast, &phase);
+                return Ok(End::Stopped);
             }
             if self.idle_since.is_some_and(|since| since.elapsed() > GRACE) {
                 stop(&mut cast, &phase);
