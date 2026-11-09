@@ -1,5 +1,5 @@
 //! Minimal HTTP server: one endless WAV stream per client at
-//! `/stream/<token>/<room>`.
+//! `/stream/<token>/<room>`, and the logo shown on screens at [`LOGO_PATH`].
 //!
 //! The Cast devices fetch the stream without authentication, so the server
 //! listens on every interface. The room key is broadcast by mDNS: the token, a
@@ -25,6 +25,10 @@ pub type Hubs = Arc<Mutex<HashMap<String, Arc<Hub>>>>;
 const NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const BUSY: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// Where the logo is served. It is public: it reveals nothing, so it needs no token.
+pub const LOGO_PATH: &str = "/logo.png";
+const LOGO: &[u8] = include_bytes!("../assets/logo.png");
 
 /// Connections served at the same time. Each one holds a thread.
 const MAX_CLIENTS: usize = 32;
@@ -82,6 +86,20 @@ fn handle(mut socket: TcpStream, hubs: &Hubs, shared: &Shared) -> std::io::Resul
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
+    if path == LOGO_PATH && (method == "GET" || method == "HEAD") {
+        socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: image/png\r\n\
+                 Content-Length: {}\r\n\
+                 Cache-Control: max-age=86400\r\n\
+                 Connection: close\r\n\r\n",
+                LOGO.len()
+            )
+            .as_bytes(),
+        )?;
+        return if method == "GET" { socket.write_all(LOGO) } else { Ok(()) };
+    }
     let key = path
         .strip_prefix("/stream/")
         .and_then(|rest| rest.split_once('/'))

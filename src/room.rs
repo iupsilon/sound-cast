@@ -22,10 +22,11 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::castv2::{self, Connection, Message};
 use crate::discovery::Device;
+use crate::http;
 use crate::sink;
 use crate::status::{Level, Phase as Shown, Shared};
 
@@ -377,13 +378,19 @@ impl Room {
     /// One Cast session: connect, launch the receiver, load the stream, then
     /// watch it until the sink goes idle, the device is taken, or it fails.
     fn session(&mut self) -> Result<End> {
-        let url = format!(
-            "http://{}:{}/stream/{}/{}",
-            local_ip_towards(self.device.address)?,
-            self.port,
-            self.shared.token,
-            self.device.key
-        );
+        let base = format!("http://{}:{}", local_ip_towards(self.device.address)?, self.port);
+        // Screens show the room name over the logo. Speakers ignore it.
+        let media = json!({
+            "contentId": format!("{base}/stream/{}/{}", self.shared.token, self.device.key),
+            "contentType": "audio/wav",
+            "streamType": "LIVE",
+            "metadata": {
+                "metadataType": 3,
+                "title": self.device.name,
+                "artist": "sound-cast",
+                "images": [{ "url": format!("{base}{}", http::LOGO_PATH), "width": 512, "height": 512 }],
+            },
+        });
         self.log(&format!("connecting to {}", self.device.address));
         self.show(Shown::Connecting, "", None);
         self.player = Shown::Loading;
@@ -450,7 +457,7 @@ impl Room {
                 continue;
             };
             last_heard = Instant::now();
-            if let Some(end) = self.handle(&mut cast, &mut phase, &message, &url)? {
+            if let Some(end) = self.handle(&mut cast, &mut phase, &message, &media)? {
                 return Ok(end);
             }
         }
@@ -462,7 +469,7 @@ impl Room {
         cast: &mut Connection,
         phase: &mut Phase,
         message: &Message,
-        url: &str,
+        media: &Value,
     ) -> Result<Option<End>> {
         let payload = &message.payload;
         match (message.namespace.as_str(), message.kind()) {
@@ -504,12 +511,7 @@ impl Room {
                                     "sessionId": session,
                                     "autoplay": true,
                                     "currentTime": 0,
-                                    "media": {
-                                        "contentId": url,
-                                        "contentType": "audio/wav",
-                                        "streamType": "LIVE",
-                                        "metadata": { "metadataType": 0, "title": "sound-cast" },
-                                    },
+                                    "media": media,
                                 }),
                             )?;
                             *phase = Phase::Loading {

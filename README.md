@@ -17,7 +17,8 @@ its audio plays in that room. Nothing is cast while nothing plays.
 - **Cast**: when a sink receives audio, the daemon starts the default media
   receiver on the device and loads the stream. After 20 s without audio it stops
   the receiver. If another sender takes the device, the daemon yields until its
-  own audio stops and starts again.
+  own audio stops and starts again. A device with a screen (a TV) shows the
+  room name over the sound-cast logo, served at `http://<host>:<port>/logo.png`.
 - **Volume**: the sink volume and mute are the device's volume and mute. A
   change on either side moves the other. The audio itself is always sent at
   full level. When a session starts, the device's level wins, so a sink left at
