@@ -7,6 +7,8 @@
 //! yielded --sink idle--> waiting
 //! ```
 //!
+//! A device taken while the sink is idle (lingering) just ends the session.
+//!
 //! A room casts only while something plays on its sink. When another sender
 //! takes the device, the room yields and does not take it back until its own
 //! audio stops and starts again, or until a client asks to resume.
@@ -37,6 +39,8 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 const PING_EVERY: Duration = Duration::from_secs(5);
 /// Silence from the device for this long means the connection is dead.
 const DEAD_AFTER: Duration = Duration::from_secs(15);
+/// How long a takeover waits for news that the sink went idle.
+const SETTLE: Duration = Duration::from_secs(2);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Volume levels closer than this are the same level.
@@ -171,11 +175,23 @@ impl Room {
             let outcome = self.session();
             self.busy.store(false, Ordering::Release);
 
+            // When the audio moves from this room to a group it belongs to, the
+            // group can take the device before PipeWire reports this sink idle.
+            // Give that report a moment before treating it as a real takeover.
+            if matches!(outcome, Ok(End::Yielded)) && self.active && !self.wait(SETTLE) {
+                return;
+            }
+
             match outcome {
                 Ok(End::Shutdown) => return,
                 Ok(End::Idle) => {
                     self.log("idle, session closed");
                     self.event(Level::Info, "idle_stop", json!({ "seconds": GRACE.as_secs() }));
+                }
+                // Taken while the sink was idle (for example by a speaker group
+                // this room belongs to): nothing is lost, the room is just free.
+                Ok(End::Yielded) if !self.active => {
+                    self.log("device taken by another sender while idle, session closed");
                 }
                 Ok(End::Yielded) => {
                     self.log("device taken by another sender, yielding");
