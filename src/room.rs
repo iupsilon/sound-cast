@@ -22,6 +22,7 @@ use serde_json::json;
 
 use crate::castv2::{self, Connection, Message};
 use crate::discovery::Device;
+use crate::sink;
 
 /// The default media receiver application.
 const APP_ID: &str = "CC1AD845";
@@ -35,10 +36,19 @@ const PING_EVERY: Duration = Duration::from_secs(5);
 const DEAD_AFTER: Duration = Duration::from_secs(15);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Volume levels closer than this are the same level.
+const SAME_LEVEL: f32 = 0.005;
+/// Shortest time between two volume commands to the device.
+const VOLUME_EVERY: Duration = Duration::from_millis(100);
+/// After a volume command, the device's own reports are ignored for this long:
+/// they describe values that are already out of date.
+const VOLUME_HOLD: Duration = Duration::from_secs(1);
 
 pub enum Control {
     /// The sink started or stopped receiving audio.
     Active(bool),
+    /// The sink volume changed. `level` is on the slider scale, 1.0 is 100%.
+    Volume { level: f32, muted: bool },
     /// Discovery saw the device again, maybe at a new address.
     Device(Device),
     Shutdown,
@@ -59,10 +69,37 @@ enum Phase {
     Playing { transport: String, session: String },
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct Volume {
+    /// 0.0 to 1.0.
+    level: f32,
+    muted: bool,
+}
+
+impl std::fmt::Display for Volume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:.0}%{}", self.level * 100.0, if self.muted { " muted" } else { "" })
+    }
+}
+
+impl Volume {
+    fn same_as(self, other: Volume) -> bool {
+        (self.level - other.level).abs() < SAME_LEVEL && self.muted == other.muted
+    }
+}
+
 pub struct Room {
     device: Device,
     port: u16,
     control: Receiver<Control>,
+    sinks: pipewire::channel::Sender<sink::Command>,
+    /// The volume of the sink.
+    volume: Volume,
+    /// The volume of the device, once it has reported it in this session.
+    device_volume: Option<Volume>,
+    volume_sent: Instant,
+    /// False with `--no-cast`: the room never opens a session.
+    cast: bool,
     /// True while a Cast session is open. Read by the manager.
     busy: Arc<AtomicBool>,
     active: bool,
@@ -71,8 +108,28 @@ pub struct Room {
 }
 
 impl Room {
-    pub fn new(device: Device, port: u16, control: Receiver<Control>, busy: Arc<AtomicBool>) -> Self {
-        Self { device, port, control, busy, active: false, idle_since: None, backoff: BACKOFF_MIN }
+    pub fn new(
+        device: Device,
+        port: u16,
+        control: Receiver<Control>,
+        sinks: pipewire::channel::Sender<sink::Command>,
+        busy: Arc<AtomicBool>,
+        cast: bool,
+    ) -> Self {
+        Self {
+            device,
+            port,
+            control,
+            sinks,
+            volume: Volume { level: 1.0, muted: false },
+            device_volume: None,
+            volume_sent: Instant::now(),
+            cast,
+            busy,
+            active: false,
+            idle_since: None,
+            backoff: BACKOFF_MIN,
+        }
     }
 
     /// Runs until shutdown.
@@ -80,7 +137,7 @@ impl Room {
         let mut yielded = false;
         loop {
             // Wait for audio. A yielded room also waits for the audio to stop first.
-            while !self.active || yielded {
+            while !self.active || yielded || !self.cast {
                 match self.control.recv() {
                     Ok(Control::Shutdown) | Err(_) => return,
                     Ok(control) => self.apply(control),
@@ -122,8 +179,62 @@ impl Room {
                 self.active = active;
                 self.idle_since = (!active).then(Instant::now);
             }
+            Control::Volume { level, muted } => {
+                self.volume = Volume { level: level.clamp(0.0, 1.0), muted };
+            }
             Control::Device(device) => self.device = device,
             Control::Shutdown => {}
+        }
+    }
+
+    /// Sends the sink volume to the device when the two differ.
+    fn push_volume(&mut self, cast: &mut Connection) -> Result<()> {
+        // Until the device has reported its volume, it is the one that leads.
+        let Some(device) = self.device_volume else {
+            return Ok(());
+        };
+        if self.volume.same_as(device) || self.volume_sent.elapsed() < VOLUME_EVERY {
+            return Ok(());
+        }
+        if (self.volume.level - device.level).abs() >= SAME_LEVEL {
+            cast.request(
+                castv2::NS_RECEIVER,
+                castv2::RECEIVER,
+                json!({ "type": "SET_VOLUME", "volume": { "level": self.volume.level } }),
+            )?;
+        }
+        if self.volume.muted != device.muted {
+            cast.request(
+                castv2::NS_RECEIVER,
+                castv2::RECEIVER,
+                json!({ "type": "SET_VOLUME", "volume": { "muted": self.volume.muted } }),
+            )?;
+        }
+        self.log(&format!("volume to device: {}", self.volume));
+        self.device_volume = Some(self.volume);
+        self.volume_sent = Instant::now();
+        Ok(())
+    }
+
+    /// Takes a volume the device reported and moves the sink to it.
+    fn pull_volume(&mut self, reported: &serde_json::Value) {
+        let (Some(level), Some(muted)) = (reported["level"].as_f64(), reported["muted"].as_bool())
+        else {
+            return;
+        };
+        if self.device_volume.is_some() && self.volume_sent.elapsed() < VOLUME_HOLD {
+            return;
+        }
+        let reported = Volume { level: level as f32, muted };
+        self.device_volume = Some(reported);
+        if !self.volume.same_as(reported) {
+            self.log(&format!("volume from device: {reported}"));
+            self.volume = reported;
+            let _ = self.sinks.send(sink::Command::SetVolume {
+                key: self.device.key.clone(),
+                level: reported.level,
+                muted: reported.muted,
+            });
         }
     }
 
@@ -157,6 +268,9 @@ impl Room {
             json!({ "type": "LAUNCH", "appId": APP_ID }),
         )?;
 
+        // The device leads at the start of a session: a sink left at 100%
+        // must not make a quiet speaker loud.
+        self.device_volume = None;
         let mut phase = Phase::Launching { request };
         let started = Instant::now();
         let mut last_ping = Instant::now();
@@ -184,6 +298,7 @@ impl Room {
                 stop(&mut cast, &phase);
                 bail!("playback did not start");
             }
+            self.push_volume(&mut cast)?;
             if last_ping.elapsed() > PING_EVERY {
                 cast.send(castv2::NS_HEARTBEAT, castv2::RECEIVER, &json!({ "type": "PING" }))?;
                 last_ping = Instant::now();
@@ -222,6 +337,7 @@ impl Room {
                 bail!("launch refused: {}", payload["reason"]);
             }
             (castv2::NS_RECEIVER, "RECEIVER_STATUS") => {
+                self.pull_volume(&payload["status"]["volume"]);
                 let apps = payload["status"]["applications"].as_array();
                 let apps = apps.map(Vec::as_slice).unwrap_or_default();
                 match phase {

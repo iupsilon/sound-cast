@@ -2,13 +2,19 @@
 //!
 //! Each sink is a native PipeWire node: it exists only while the daemon runs,
 //! so a crash leaves nothing behind. Whatever applications play into it arrives
-//! in the process callback as 48 kHz stereo S16LE.
+//! in the process callback and leaves it as 48 kHz stereo S16LE.
+//!
+//! The sink volume is not applied to the audio: it is reported to the room,
+//! which sets it on the Cast device. PipeWire's converter does scale the
+//! samples, so the process callback divides that gain out again. The samples
+//! are taken as 32-bit float to make this lossless.
 //!
 //! PipeWire objects belong to the loop thread. Other threads ask for sinks
 //! through [`Command`]s.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Sender, SyncSender};
 
 use anyhow::{Context, Result};
@@ -34,21 +40,81 @@ pub enum Command {
         /// Told when the sink starts and stops receiving audio.
         control: Sender<Control>,
     },
+    /// Moves the sink volume to follow the Cast device.
+    SetVolume {
+        key: String,
+        /// 0.0 to 1.0, on the scale of the volume slider.
+        level: f32,
+        muted: bool,
+    },
     Remove {
         key: String,
     },
 }
 
-/// What the callbacks of one sink need.
+/// Below this linear gain the audio is treated as silence.
+const MIN_GAIN: f32 = 1e-6;
+
+/// What the callbacks of one sink need. The process callback runs on the
+/// realtime thread and the others on the loop thread, so the shared values
+/// are atomics.
 struct Tap {
     captured: SyncSender<Vec<u8>>,
     control: Sender<Control>,
+    /// Linear gain the converter applies now, as `f32` bits.
+    gain: AtomicU32,
+    /// Gain the process callback saw in its previous cycle, as `f32` bits.
+    previous_gain: AtomicU32,
+    muted: AtomicBool,
+}
+
+impl Tap {
+    fn new(captured: SyncSender<Vec<u8>>, control: Sender<Control>) -> Self {
+        Self {
+            captured,
+            control,
+            gain: AtomicU32::new(1f32.to_bits()),
+            previous_gain: AtomicU32::new(1f32.to_bits()),
+            muted: AtomicBool::new(false),
+        }
+    }
+
+    /// Converts float samples to S16LE at full level, whatever the sink volume.
+    fn to_pcm(&self, samples: &[u8]) -> Vec<u8> {
+        let gain = f32::from_bits(self.gain.load(Ordering::Relaxed));
+        let previous = f32::from_bits(self.previous_gain.swap(gain.to_bits(), Ordering::Relaxed));
+        // The converter and this callback can see a volume change one cycle
+        // apart. Dividing by the larger gain makes that cycle quieter, never louder.
+        let gain = gain.max(previous);
+        let scale = if self.muted.load(Ordering::Relaxed) || gain < MIN_GAIN {
+            0.0
+        } else {
+            f32::from(i16::MAX) / gain
+        };
+        let mut pcm = Vec::with_capacity(samples.len() / 2);
+        for sample in samples.chunks_exact(4) {
+            let value = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]) * scale;
+            // `as` saturates, so an over-range sample clips instead of wrapping.
+            pcm.extend_from_slice(&(value as i16).to_le_bytes());
+        }
+        pcm
+    }
 }
 
 /// A live sink. The listener is declared first so it is dropped first.
 struct Sink {
     _listener: StreamListener<Tap>,
-    _stream: StreamRc,
+    stream: StreamRc,
+}
+
+impl Sink {
+    fn set_volume(&self, level: f32, muted: bool) -> Result<()> {
+        // The slider scale is the cube root of the linear gain.
+        let gain = level.clamp(0.0, 1.0).powi(3);
+        self.stream.set_control(spa::sys::SPA_PROP_channelVolumes, &[gain; CHANNELS as usize])?;
+        self.stream.set_control(spa::sys::SPA_PROP_mute, &[f32::from(u8::from(muted))])?;
+        Ok(())
+    }
 }
 
 /// Runs the PipeWire loop until SIGINT or SIGTERM. Every sink is removed on return.
@@ -64,11 +130,18 @@ pub fn run(commands: pw::channel::Receiver<Command>) -> Result<()> {
         let core = core.clone();
         move |command| match command {
             Command::Add { key, node_name, description, captured, control } => {
-                match create(&core, &node_name, &description, Tap { captured, control }) {
+                match create(&core, &node_name, &description, Tap::new(captured, control)) {
                     Ok(sink) => {
                         sinks.borrow_mut().insert(key, sink);
                     }
                     Err(error) => eprintln!("sink {node_name}: {error:#}"),
+                }
+            }
+            Command::SetVolume { key, level, muted } => {
+                if let Some(sink) = sinks.borrow().get(&key)
+                    && let Err(error) = sink.set_volume(level, muted)
+                {
+                    eprintln!("sink {key}: set volume: {error:#}");
                 }
             }
             Command::Remove { key } => {
@@ -107,6 +180,32 @@ fn create(core: &CoreRc, node_name: &str, description: &str, tap: Tap) -> Result
                 let _ = tap.control.send(Control::Active(is));
             }
         })
+        .control_info(|_, tap, id, control| {
+            // SAFETY: PipeWire passes a control that is valid for this call,
+            // with `n_values` readable floats behind `values`.
+            let values = unsafe {
+                match control.as_ref() {
+                    Some(c) if !c.values.is_null() => {
+                        std::slice::from_raw_parts(c.values, c.n_values as usize)
+                    }
+                    _ => return,
+                }
+            };
+            match id {
+                spa::sys::SPA_PROP_channelVolumes => {
+                    let gain = values.iter().copied().fold(0.0, f32::max);
+                    tap.gain.store(gain.to_bits(), Ordering::Relaxed);
+                }
+                spa::sys::SPA_PROP_mute => {
+                    tap.muted.store(values.first().is_some_and(|v| *v != 0.0), Ordering::Relaxed);
+                }
+                _ => return,
+            }
+            let _ = tap.control.send(Control::Volume {
+                level: f32::from_bits(tap.gain.load(Ordering::Relaxed)).cbrt(),
+                muted: tap.muted.load(Ordering::Relaxed),
+            });
+        })
         .process(|stream, tap| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
@@ -117,11 +216,11 @@ fn create(core: &CoreRc, node_name: &str, description: &str, tap: Tap) -> Result
             let offset = data.chunk().offset() as usize;
             let size = data.chunk().size() as usize;
             if let Some(bytes) = data.data()
-                && let Some(pcm) = bytes.get(offset..offset + size)
-                && !pcm.is_empty()
+                && let Some(samples) = bytes.get(offset..offset + size)
+                && !samples.is_empty()
             {
                 // Never block the realtime thread: a full queue drops the chunk.
-                let _ = tap.captured.try_send(pcm.to_vec());
+                let _ = tap.captured.try_send(tap.to_pcm(samples));
             }
         })
         .register()
@@ -132,7 +231,7 @@ fn create(core: &CoreRc, node_name: &str, description: &str, tap: Tap) -> Result
     position[1] = spa::sys::SPA_AUDIO_CHANNEL_FR;
 
     let mut info = AudioInfoRaw::new();
-    info.set_format(AudioFormat::S16LE);
+    info.set_format(AudioFormat::F32LE);
     info.set_rate(RATE);
     info.set_channels(CHANNELS);
     info.set_position(position);
@@ -161,5 +260,5 @@ fn create(core: &CoreRc, node_name: &str, description: &str, tap: Tap) -> Result
         )
         .context("connect stream")?;
 
-    Ok(Sink { _listener: listener, _stream: stream })
+    Ok(Sink { _listener: listener, stream })
 }

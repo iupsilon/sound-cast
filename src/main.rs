@@ -22,10 +22,11 @@ use hub::Hub;
 use room::{Control, Room};
 
 const USAGE: &str = "\
-usage: sound-cast [--port PORT] [--only NAME]...
+usage: sound-cast [--port PORT] [--only NAME]... [--no-cast]
 
   --port PORT   TCP port of the audio streams (default 3000)
-  --only NAME   create a sink only for this Cast device or group (repeatable)";
+  --only NAME   create a sink only for this Cast device or group (repeatable)
+  --no-cast     create the sinks and serve the streams, but never play on a device";
 
 /// A device missing from the network for this long loses its sink.
 const LOST_GRACE: Duration = Duration::from_secs(60);
@@ -50,6 +51,7 @@ struct RoomHandle {
 struct Manager {
     port: u16,
     only: Vec<String>,
+    cast: bool,
     hubs: http::Hubs,
     sinks: pw::channel::Sender<sink::Command>,
     rooms: HashMap<String, RoomHandle>,
@@ -94,7 +96,10 @@ impl Manager {
         if self.rooms.values().any(|r| r.name == node_name) {
             node_name = format!("{node_name}.{:.6}", device.key);
         }
-        eprintln!("{}: found at {}, sink {node_name}", device.name, device.address);
+        eprintln!(
+            "{}: found at {}, sink {node_name}, stream /stream/{}",
+            device.name, device.address, device.key
+        );
 
         let (hub, captured) = Hub::start();
         let (control_tx, control_rx) = channel();
@@ -108,7 +113,7 @@ impl Manager {
             control: control_tx.clone(),
         });
         let key = device.key.clone();
-        let room = Room::new(device, self.port, control_rx, busy.clone());
+        let room = Room::new(device, self.port, control_rx, self.sinks.clone(), busy.clone(), self.cast);
         self.rooms.insert(
             key,
             RoomHandle {
@@ -182,12 +187,14 @@ fn block_termination_signals() {
 fn main() -> Result<()> {
     let mut port = 3000u16;
     let mut only = Vec::new();
+    let mut cast = true;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--port" => port = args.next().ok_or(anyhow!("--port needs a value"))?.parse()?,
             "--only" => only.push(args.next().ok_or(anyhow!("--only needs a name"))?),
+            "--no-cast" => cast = false,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -203,7 +210,7 @@ fn main() -> Result<()> {
 
     let (events_tx, events_rx) = channel();
     let (sinks_tx, sinks_rx) = pw::channel::channel();
-    let manager = Manager { port, only, hubs, sinks: sinks_tx, rooms: HashMap::new() };
+    let manager = Manager { port, only, cast, hubs, sinks: sinks_tx, rooms: HashMap::new() };
     let manager = thread::spawn(move || manager.run(events_rx));
     {
         let events = events_tx.clone();

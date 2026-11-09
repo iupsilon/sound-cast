@@ -16,6 +16,10 @@ its audio plays in that room. Nothing is cast while nothing plays.
   receiver on the device and loads the stream. After 20 s without audio it stops
   the receiver. If another sender takes the device, the daemon yields until its
   own audio stops and starts again.
+- **Volume**: the sink volume and mute are the device's volume and mute. A
+  change on either side moves the other. The audio itself is always sent at
+  full level. When a session starts, the device's volume wins, so a sink left at
+  100% does not make a quiet speaker loud.
 - **Discovery**: mDNS, continuous. A device that leaves the network for a minute
   loses its sink.
 
@@ -34,8 +38,10 @@ Options:
 - `--port PORT`: TCP port of the audio streams (default 3000). The Cast devices
   fetch the audio from this port, so the firewall must allow it from the LAN.
 - `--only NAME`: create a sink only for this device or group. Repeatable.
+- `--no-cast`: create the sinks and serve the streams, but never play on a
+  device. For tests.
 
 ## Status
 
-Early. Missing: volume sync between sink and device, a control interface for a
+Early. Missing: a control interface for a
 desktop widget, compressed audio (FLAC), a systemd unit and packaging.
