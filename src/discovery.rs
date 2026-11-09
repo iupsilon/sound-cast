@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::mpsc::Sender;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 
 use crate::Event;
@@ -21,7 +21,7 @@ pub struct Device {
 }
 
 /// Browses forever and reports every device found or lost.
-/// Returns when the receiving side of `events` is gone.
+/// Returns when the receiving side of `events` is gone, and fails when mDNS stops.
 pub fn run(events: Sender<Event>) -> Result<()> {
     let mdns = ServiceDaemon::new().context("start mDNS")?;
     let found = mdns.browse(SERVICE).context("browse mDNS")?;
@@ -51,8 +51,8 @@ pub fn run(events: Sender<Event>) -> Result<()> {
             _ => continue,
         };
         if events.send(event).is_err() {
-            break;
+            return Ok(());
         }
     }
-    Ok(())
+    bail!("mDNS browsing stopped")
 }

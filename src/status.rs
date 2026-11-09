@@ -121,6 +121,8 @@ struct Inner {
 }
 
 pub struct Shared {
+    /// The secret part of the stream URLs. Never published.
+    pub token: String,
     inner: Mutex<Inner>,
     status_dirty: AtomicBool,
     events_dirty: AtomicBool,
@@ -129,8 +131,9 @@ pub struct Shared {
 }
 
 impl Shared {
-    pub fn new(port: u16) -> Arc<Self> {
+    pub fn new(port: u16, token: String) -> Arc<Self> {
         Arc::new(Self {
+            token,
             inner: Mutex::new(Inner { port, ..Inner::default() }),
             status_dirty: AtomicBool::new(false),
             events_dirty: AtomicBool::new(false),

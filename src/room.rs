@@ -50,6 +50,8 @@ const VOLUME_EVERY: Duration = Duration::from_millis(100);
 /// After a volume command, the device's own reports are ignored for this long:
 /// they describe values that are already out of date.
 const VOLUME_HOLD: Duration = Duration::from_secs(1);
+/// How long stopping a receiver that is still launching waits for its session id.
+const STOP_WAIT: Duration = Duration::from_secs(2);
 
 pub enum Control {
     /// The sink started or stopped receiving audio.
@@ -111,6 +113,9 @@ pub struct Room {
     /// The volume of the device, once it has reported it in this session.
     device_volume: Option<Volume>,
     volume_sent: Instant,
+    /// The last volume the device reported within [`VOLUME_HOLD`]. Taken once
+    /// the hold is over, in case the device did not settle where it was told.
+    held_volume: Option<Volume>,
     /// False with `--no-cast`: the room never opens a session.
     cast: bool,
     /// True while a Cast session is open. Read by the manager.
@@ -148,6 +153,7 @@ impl Room {
             volume: Volume { level: 1.0, muted: false },
             device_volume: None,
             volume_sent: Instant::now(),
+            held_volume: None,
             cast,
             busy,
             shared,
@@ -306,6 +312,8 @@ impl Room {
         self.shared.set_volume(&self.device.key, self.volume.level, self.volume.muted);
         self.device_volume = Some(self.volume);
         self.volume_sent = Instant::now();
+        // Reports held so far describe the device before this command.
+        self.held_volume = None;
         Ok(())
     }
 
@@ -315,19 +323,41 @@ impl Room {
         else {
             return;
         };
+        let reported = Volume { level: level as f32, muted };
         if self.device_volume.is_some() && self.volume_sent.elapsed() < VOLUME_HOLD {
+            self.held_volume = Some(reported);
             return;
         }
-        let reported = Volume { level: level as f32, muted };
+        self.take_device_volume(reported);
+    }
+
+    /// Takes the last report held back by [`VOLUME_HOLD`], once the hold is over.
+    fn settle_volume(&mut self) {
+        if self.volume_sent.elapsed() >= VOLUME_HOLD
+            && let Some(reported) = self.held_volume.take()
+            && !self.device_volume.is_some_and(|device| device.same_as(reported))
+        {
+            self.take_device_volume(reported);
+        }
+    }
+
+    fn take_device_volume(&mut self, reported: Volume) {
+        // At the start of a session the device leads the level only. The sink
+        // cannot be muted while it plays, so a device left muted is unmuted.
+        let target = if self.device_volume.is_none() {
+            Volume { level: reported.level, muted: self.volume.muted }
+        } else {
+            reported
+        };
         self.device_volume = Some(reported);
         self.shared.set_volume(&self.device.key, reported.level, reported.muted);
-        if !self.volume.same_as(reported) {
-            self.log(&format!("volume from device: {reported}"));
-            self.volume = reported;
+        if !self.volume.same_as(target) {
+            self.log(&format!("volume from device: {target}"));
+            self.volume = target;
             let _ = self.sinks.send(sink::Command::SetVolume {
                 key: self.device.key.clone(),
-                level: reported.level,
-                muted: reported.muted,
+                level: target.level,
+                muted: target.muted,
             });
         }
     }
@@ -348,9 +378,10 @@ impl Room {
     /// watch it until the sink goes idle, the device is taken, or it fails.
     fn session(&mut self) -> Result<End> {
         let url = format!(
-            "http://{}:{}/stream/{}",
+            "http://{}:{}/stream/{}/{}",
             local_ip_towards(self.device.address)?,
             self.port,
+            self.shared.token,
             self.device.key
         );
         self.log(&format!("connecting to {}", self.device.address));
@@ -369,6 +400,7 @@ impl Room {
         // The device leads at the start of a session: a sink left at 100%
         // must not make a quiet speaker loud.
         self.device_volume = None;
+        self.held_volume = None;
         let mut phase = Phase::Launching { request };
         let started = Instant::now();
         let mut last_ping = Instant::now();
@@ -408,6 +440,7 @@ impl Room {
             }
             self.show_session(&phase);
             self.push_volume(&mut cast)?;
+            self.settle_volume();
             if last_ping.elapsed() > PING_EVERY {
                 cast.send(castv2::NS_HEARTBEAT, castv2::RECEIVER, &json!({ "type": "PING" }))?;
                 last_ping = Instant::now();
@@ -538,17 +571,47 @@ impl Room {
 /// Stops our receiver application, if it was launched. Errors do not matter:
 /// the session is being abandoned anyway.
 fn stop(cast: &mut Connection, phase: &Phase) {
-    let (Phase::Loading { transport, session } | Phase::Playing { transport, session }) = phase
-    else {
-        return;
-    };
+    match phase {
+        Phase::Launching { .. } => {
+            // The launch may have gone through without its answer yet: ask
+            // the device for the session id, so the receiver does not stay on.
+            if let Some(session) = launched_session(cast) {
+                stop_session(cast, &session);
+            }
+        }
+        Phase::Loading { transport, session } | Phase::Playing { transport, session } => {
+            stop_session(cast, session);
+            let _ = cast.send(castv2::NS_CONNECTION, transport, &json!({ "type": "CLOSE" }));
+        }
+    }
+    let _ = cast.send(castv2::NS_CONNECTION, castv2::RECEIVER, &json!({ "type": "CLOSE" }));
+}
+
+fn stop_session(cast: &mut Connection, session: &str) {
     let _ = cast.request(
         castv2::NS_RECEIVER,
         castv2::RECEIVER,
         json!({ "type": "STOP", "sessionId": session }),
     );
-    let _ = cast.send(castv2::NS_CONNECTION, transport, &json!({ "type": "CLOSE" }));
-    let _ = cast.send(castv2::NS_CONNECTION, castv2::RECEIVER, &json!({ "type": "CLOSE" }));
+}
+
+/// The session id of our receiver application, if the device runs it.
+/// Waits at most [`STOP_WAIT`] for the answer.
+fn launched_session(cast: &mut Connection) -> Option<String> {
+    cast.request(castv2::NS_RECEIVER, castv2::RECEIVER, json!({ "type": "GET_STATUS" })).ok()?;
+    let deadline = Instant::now() + STOP_WAIT;
+    while Instant::now() < deadline {
+        let Some(message) = cast.poll().ok()? else {
+            continue;
+        };
+        if message.namespace != castv2::NS_RECEIVER || message.kind() != "RECEIVER_STATUS" {
+            continue;
+        }
+        let apps = message.payload["status"]["applications"].as_array()?;
+        let ours = apps.iter().find(|app| app["appId"] == APP_ID)?;
+        return ours["sessionId"].as_str().map(str::to_string);
+    }
+    None
 }
 
 /// The local address this host uses to reach `peer`.

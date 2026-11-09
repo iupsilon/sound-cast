@@ -20,7 +20,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{Sender, SyncSender};
+use std::sync::mpsc::Sender;
 
 use anyhow::{Context, Result};
 use pipewire as pw;
@@ -32,7 +32,7 @@ use pw::stream::{StreamFlags, StreamListener, StreamRc, StreamState};
 use spa::param::audio::{AudioFormat, AudioInfoRaw};
 use spa::pod::Pod;
 
-use crate::hub::{CHANNELS, RATE};
+use crate::hub::{CHANNELS, Capture, RATE};
 use crate::room::Control;
 
 pub enum Command {
@@ -41,7 +41,7 @@ pub enum Command {
         node_name: String,
         description: String,
         /// Receives the audio played into the sink.
-        captured: SyncSender<Vec<u8>>,
+        captured: Capture,
         /// Told when the sink starts and stops receiving audio.
         control: Sender<Control>,
     },
@@ -55,6 +55,8 @@ pub enum Command {
     Remove {
         key: String,
     },
+    /// Ends [`run`] as SIGTERM would.
+    Quit,
 }
 
 /// Below this linear gain the audio is treated as silence.
@@ -68,7 +70,7 @@ const SILENCE_FRAMES: u64 = 3 * RATE as u64;
 /// realtime thread and the others on the loop thread, so the shared values
 /// are atomics.
 struct Tap {
-    captured: SyncSender<Vec<u8>>,
+    captured: Capture,
     control: Sender<Control>,
     /// Linear gain the converter applies now, as `f32` bits.
     gain: AtomicU32,
@@ -82,7 +84,7 @@ struct Tap {
 }
 
 impl Tap {
-    fn new(captured: SyncSender<Vec<u8>>, control: Sender<Control>) -> Self {
+    fn new(captured: Capture, control: Sender<Control>) -> Self {
         Self {
             captured,
             control,
@@ -109,9 +111,7 @@ impl Tap {
         let audible = !self.muted.load(Ordering::Relaxed) && gain >= MIN_GAIN;
         let threshold = SOUND_LEVEL * gain;
         let loud = audible
-            && samples.chunks_exact(4).any(|sample| {
-                f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]).abs() > threshold
-            });
+            && samples.as_chunks::<4>().0.iter().any(|s| f32::from_le_bytes(*s).abs() > threshold);
         if loud {
             self.silent_frames.store(0, Ordering::Relaxed);
             self.set_sounding(true);
@@ -125,6 +125,7 @@ impl Tap {
     }
 
     /// Converts float samples to S16LE at full level, whatever the sink volume.
+    /// Fills a spare buffer from the hub: it allocates only when none is left.
     fn to_pcm(&self, samples: &[u8]) -> Vec<u8> {
         let gain = f32::from_bits(self.gain.load(Ordering::Relaxed));
         let previous = f32::from_bits(self.previous_gain.swap(gain.to_bits(), Ordering::Relaxed));
@@ -136,9 +137,11 @@ impl Tap {
         } else {
             f32::from(i16::MAX) / gain
         };
-        let mut pcm = Vec::with_capacity(samples.len() / 2);
-        for sample in samples.chunks_exact(4) {
-            let value = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]) * scale;
+        let mut pcm = self.captured.spare.try_recv().unwrap_or_default();
+        pcm.clear();
+        pcm.reserve(samples.len() / 2);
+        for sample in samples.as_chunks::<4>().0 {
+            let value = f32::from_le_bytes(*sample) * scale;
             // `as` saturates, so an over-range sample clips instead of wrapping.
             pcm.extend_from_slice(&(value as i16).to_le_bytes());
         }
@@ -162,7 +165,8 @@ impl Sink {
     }
 }
 
-/// Runs the PipeWire loop until SIGINT or SIGTERM. Every sink is removed on return.
+/// Runs the PipeWire loop until SIGINT, SIGTERM or [`Command::Quit`]. Every
+/// sink is removed on return.
 pub fn run(commands: pw::channel::Receiver<Command>) -> Result<()> {
     pw::init();
 
@@ -173,6 +177,7 @@ pub fn run(commands: pw::channel::Receiver<Command>) -> Result<()> {
     let sinks: RefCell<HashMap<String, Sink>> = RefCell::default();
     let _commands = commands.attach(mainloop.loop_(), {
         let core = core.clone();
+        let mainloop = mainloop.clone();
         move |command| match command {
             Command::Add { key, node_name, description, captured, control } => {
                 match create(&core, &node_name, &description, Tap::new(captured, control)) {
@@ -192,6 +197,7 @@ pub fn run(commands: pw::channel::Receiver<Command>) -> Result<()> {
             Command::Remove { key } => {
                 sinks.borrow_mut().remove(&key);
             }
+            Command::Quit => mainloop.quit(),
         }
     });
 
@@ -265,7 +271,7 @@ fn create(core: &CoreRc, node_name: &str, description: &str, tap: Tap) -> Result
             {
                 tap.watch_level(samples);
                 // Never block the realtime thread: a full queue drops the chunk.
-                let _ = tap.captured.try_send(tap.to_pcm(samples));
+                let _ = tap.captured.audio.try_send(tap.to_pcm(samples));
             }
         })
         .register()
@@ -311,7 +317,7 @@ fn create(core: &CoreRc, node_name: &str, description: &str, tap: Tap) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::{channel, sync_channel};
+    use std::sync::mpsc::channel;
 
     fn cycle(value: f32, frames: usize) -> Vec<u8> {
         value.to_le_bytes().repeat(frames * CHANNELS as usize)
@@ -319,7 +325,7 @@ mod tests {
 
     #[test]
     fn muted_sink_goes_inactive() {
-        let (captured, _audio) = sync_channel(1);
+        let (_hub, captured) = crate::hub::Hub::start();
         let (control, controls) = channel();
         let tap = Tap::new(captured, control);
 

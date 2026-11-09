@@ -11,7 +11,7 @@ mod status;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -117,7 +117,10 @@ impl Manager {
             return;
         }
 
-        let mut node_name = format!("sound-cast.{}", slug(&device.name));
+        // A name with no ASCII letter or digit falls back to the key.
+        let name = Some(slug(&device.name)).filter(|s| !s.is_empty());
+        let mut node_name =
+            format!("sound-cast.{}", name.unwrap_or_else(|| device.key.to_ascii_lowercase()));
         if self.rooms.values().any(|r| r.name == node_name) {
             node_name = format!("{node_name}.{:.6}", device.key);
         }
@@ -242,7 +245,7 @@ fn main() -> Result<()> {
 
     block_termination_signals();
 
-    let shared = Shared::new(port);
+    let shared = Shared::new(port, http::new_token()?);
     let hubs = http::Hubs::default();
     http::start(port, hubs.clone(), shared.clone())?;
 
@@ -253,25 +256,41 @@ fn main() -> Result<()> {
     }
     shared.event(Level::Info, "started", None, json!({ "port": port }));
     let (sinks_tx, sinks_rx) = pw::channel::channel();
-    let manager =
-        Manager { port, only, cast, hubs, sinks: sinks_tx, shared, rooms: HashMap::new() };
+    let manager = Manager {
+        port,
+        only,
+        cast,
+        hubs,
+        sinks: sinks_tx.clone(),
+        shared,
+        rooms: HashMap::new(),
+    };
     let manager = thread::spawn(move || manager.run(events_rx));
+    // Discovery failing ends the daemon the same way a signal does, so every
+    // room stops its receiver before the process exits.
+    let discovery_error = Arc::new(Mutex::new(None));
     {
         let events = events_tx.clone();
+        let discovery_error = discovery_error.clone();
         thread::spawn(move || {
             if let Err(error) = discovery::run(events) {
                 eprintln!("discovery: {error:#}");
-                std::process::exit(1);
+                *discovery_error.lock().unwrap() = Some(error);
+                let _ = sinks_tx.send(sink::Command::Quit);
             }
         });
     }
 
-    // Blocks until SIGINT or SIGTERM.
+    // Blocks until SIGINT, SIGTERM or a discovery failure.
     let result = sink::run(sinks_rx);
 
     let _ = events_tx.send(Event::Shutdown);
     let _ = manager.join();
-    result
+    result?;
+    match discovery_error.lock().unwrap().take() {
+        Some(error) => Err(error.context("discovery")),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

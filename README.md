@@ -11,15 +11,18 @@ its audio plays in that room. Nothing is cast while nothing plays.
 - **Sinks**: native PipeWire nodes owned by the daemon. They disappear when it
   stops.
 - **Stream**: each sink is served as an endless WAV stream (48 kHz, stereo,
-  16 bit) at `http://<host>:<port>/stream/<room>`. Nothing is written to disk.
+  16 bit) at `http://<host>:<port>/stream/<token>/<room>`. The token is a
+  random secret drawn at startup, so other hosts on the LAN cannot guess the
+  URL. Nothing is written to disk.
 - **Cast**: when a sink receives audio, the daemon starts the default media
   receiver on the device and loads the stream. After 20 s without audio it stops
   the receiver. If another sender takes the device, the daemon yields until its
   own audio stops and starts again.
 - **Volume**: the sink volume and mute are the device's volume and mute. A
   change on either side moves the other. The audio itself is always sent at
-  full level. When a session starts, the device's volume wins, so a sink left at
-  100% does not make a quiet speaker loud.
+  full level. When a session starts, the device's level wins, so a sink left at
+  100% does not make a quiet speaker loud. Mute follows the sink: a muted sink
+  never starts a session, so a device left muted is unmuted.
 - **Discovery**: mDNS, continuous. A device that leaves the network for a minute
   loses its sink.
 
