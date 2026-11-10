@@ -1,17 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#1e1b4b"/>
-      <stop offset="1" stop-color="#0f766e"/>
-    </linearGradient>
-  </defs>
-  <rect width="512" height="512" rx="96" fill="url(#bg)"/>
-  <!-- speaker -->
-  <path d="M112 208h56l72-60v216l-72-60h-56z" fill="#f8fafc"/>
-  <!-- waves -->
-  <g fill="none" stroke="#f8fafc" stroke-width="28" stroke-linecap="round">
-    <path d="M296 196a84 84 0 0 1 0 120" opacity="1"/>
-    <path d="M340 156a144 144 0 0 1 0 200" opacity=".75"/>
-    <path d="M384 116a204 204 0 0 1 0 280" opacity=".5"/>
+  <rect width="512" height="512" rx="96" fill="#0b1220"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="26">
+    <path d="M100 184v-34a32 32 0 0 1 32-32h248a32 32 0 0 1 32 32v212a32 32 0 0 1-32 32h-106" stroke="#e2e8f0"/>
+    <path d="M100 300a94 94 0 0 1 94 94" stroke="#a78bfa"/>
+    <path d="M100 236a158 158 0 0 1 158 158" stroke="#c084fc"/>
+  </g>
+  <circle cx="108" cy="386" r="22" fill="#818cf8"/>
+  <g stroke-linecap="round" stroke-width="26">
+    <line x1="262" y1="216" x2="262" y2="264" stroke="#22d3ee"/>
+    <line x1="306" y1="176" x2="306" y2="304" stroke="#38bdf8"/>
+    <line x1="350" y1="198" x2="350" y2="282" stroke="#60a5fa"/>
   </g>
 </svg>

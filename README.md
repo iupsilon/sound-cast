@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" width="128" height="128" alt="sound-cast logo"></p>
+
 # sound-cast
 
 Plays the audio of a Linux desktop on Chromecast speakers and speaker groups.
