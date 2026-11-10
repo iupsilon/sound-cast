@@ -26,12 +26,12 @@ Settings) can route audio to the sinks.*
 
 - Linux with PipeWire (with `pipewire-pulse` or not) and systemd user services.
 - Chromecast devices on the same LAN, reachable through mDNS.
-- The Cast devices fetch the audio over HTTP from the computer, on port 3000 by
+- The Cast devices fetch the audio over HTTP from the computer, on port 8574 by
   default. A firewall must allow it from the LAN, for example:
 
   ```sh
-  sudo ufw allow 3000/tcp
-  sudo firewall-cmd --permanent --add-port=3000/tcp && sudo firewall-cmd --reload
+  sudo ufw allow 8574/tcp
+  sudo firewall-cmd --permanent --add-port=8574/tcp && sudo firewall-cmd --reload
   ```
 
 ## Install
@@ -94,7 +94,7 @@ sound-cast                  # every device on the network
 sound-cast --only Sala      # only this device or group
 ```
 
-- `--port PORT`: TCP port of the audio streams (default 3000).
+- `--port PORT`: TCP port of the audio streams (default 8574).
 - `--only NAME`: create a sink only for this device or group. Repeatable.
 - `--no-cast`: create the sinks and serve the streams, but never play on a
   device. For tests.
@@ -106,7 +106,7 @@ To change the options of the service, override its command line:
 systemctl --user edit sound-cast
 # [Service]
 # ExecStart=
-# ExecStart=/usr/bin/sound-cast --port 3001
+# ExecStart=/usr/bin/sound-cast --port 8575
 ```
 
 ## How it works

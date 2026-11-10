@@ -28,7 +28,7 @@ const USAGE: &str = "\
 usage: sound-cast [--port PORT] [--only NAME]... [--no-cast]
        sound-cast --version
 
-  --port PORT   TCP port of the audio streams (default 3000)
+  --port PORT   TCP port of the audio streams (default 8574)
   --only NAME   create a sink only for this Cast device or group (repeatable)
   --no-cast     create the sinks and serve the streams, but never play on a device
   --version     print the version and exit";
@@ -227,7 +227,7 @@ fn block_termination_signals() {
 }
 
 fn main() -> Result<()> {
-    let mut port = 3000u16;
+    let mut port = 8574u16;
     let mut only = Vec::new();
     let mut cast = true;
 
