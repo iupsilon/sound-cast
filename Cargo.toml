@@ -1,6 +1,6 @@
 [package]
 name = "sound-cast"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Plays desktop audio on Chromecast speakers, one PipeWire sink per room"
 license = "GPL-3.0-or-later"
