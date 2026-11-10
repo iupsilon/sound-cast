@@ -26,10 +26,12 @@ use status::{Level, Shared};
 
 const USAGE: &str = "\
 usage: sound-cast [--port PORT] [--only NAME]... [--no-cast]
+       sound-cast --version
 
   --port PORT   TCP port of the audio streams (default 3000)
   --only NAME   create a sink only for this Cast device or group (repeatable)
-  --no-cast     create the sinks and serve the streams, but never play on a device";
+  --no-cast     create the sinks and serve the streams, but never play on a device
+  --version     print the version and exit";
 
 /// A device missing from the network for this long loses its sink.
 const LOST_GRACE: Duration = Duration::from_secs(60);
@@ -235,6 +237,10 @@ fn main() -> Result<()> {
             "--port" => port = args.next().ok_or(anyhow!("--port needs a value"))?.parse()?,
             "--only" => only.push(args.next().ok_or(anyhow!("--only needs a name"))?),
             "--no-cast" => cast = false,
+            "-V" | "--version" => {
+                println!("sound-cast {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());

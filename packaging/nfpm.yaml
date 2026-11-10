@@ -1,0 +1,52 @@
+# .deb, .rpm and Arch packages, built by packaging/package.sh.
+# VERSION comes from the environment (the version in Cargo.toml).
+name: sound-cast
+arch: amd64
+platform: linux
+version: ${VERSION}
+release: 1
+section: sound
+priority: optional
+maintainer: Yari Melzani <yari.melzani@gmail.com>
+description: |
+  Plays desktop audio on Chromecast speakers, one PipeWire sink per room.
+  sound-cast finds the Cast devices on the network and creates one PipeWire
+  sink for each. Route an application to a sink and its audio plays in that
+  room.
+vendor: Yari Melzani
+homepage: https://github.com/iupsilon/sound-cast
+license: GPL-3.0-or-later
+
+contents:
+  - src: target/release/sound-cast
+    dst: /usr/bin/sound-cast
+    file_info:
+      mode: 0755
+  - src: dist/stage/sound-cast.service
+    dst: /usr/lib/systemd/user/sound-cast.service
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/sound-cast/README.md
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/licenses/sound-cast/LICENSE
+    file_info:
+      mode: 0644
+
+overrides:
+  deb:
+    depends:
+      - libpipewire-0.3-0t64 | libpipewire-0.3-0
+      - pipewire
+  rpm:
+    depends:
+      - pipewire-libs
+      - pipewire
+  archlinux:
+    depends:
+      - gcc-libs
+      - glibc
+      - libpipewire
+      - pipewire

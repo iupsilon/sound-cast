@@ -1,24 +1,17 @@
+# Maintainer: Yari Melzani <yari.melzani@gmail.com>
 pkgname=sound-cast
-pkgver=0.1.0.r0.g0000000
+pkgver=0.1.0
 pkgrel=1
 pkgdesc="Plays desktop audio on Chromecast speakers, one PipeWire sink per room"
 arch=(x86_64)
 url="https://github.com/iupsilon/sound-cast"
-# No licence chosen yet.
-license=(LicenseRef-unlicensed)
+license=(GPL-3.0-or-later)
 depends=(gcc-libs glibc libpipewire pipewire)
 makedepends=(cargo clang git)
-source=("sound-cast::git+file:///home/yari/Repository/sound-cast")
+source=("git+$url.git#tag=v$pkgver")
 sha256sums=(SKIP)
 # GCC LTO objects from ring's C code cannot be linked by rustc's linker.
 options=(!lto)
-
-pkgver() {
-  cd sound-cast
-  local v
-  v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-  printf '%s.r%s.g%s' "$v" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
-}
 
 prepare() {
   cd sound-cast
@@ -28,7 +21,7 @@ prepare() {
 
 build() {
   cd sound-cast
-  # The package goes to other machines: no code tuned for this CPU (CachyOS
+  # The package may go to other machines: no code tuned for this CPU (CachyOS
   # sets -march=native and target-cpu=native).
   CFLAGS=${CFLAGS//-march=native/-march=x86-64}; CFLAGS=${CFLAGS//-mtune=native/-mtune=generic}
   CXXFLAGS=${CXXFLAGS//-march=native/-march=x86-64}; CXXFLAGS=${CXXFLAGS//-mtune=native/-mtune=generic}
@@ -46,4 +39,5 @@ package() {
   sed 's|^ExecStart=.*|ExecStart=/usr/bin/sound-cast|; /^# Installed with/d' sound-cast.service \
     | install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/sound-cast.service"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
