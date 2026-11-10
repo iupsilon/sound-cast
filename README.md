@@ -191,6 +191,8 @@ To install it for your user as a service:
 ```sh
 cargo install --path .
 cp sound-cast.service ~/.config/systemd/user/
+# The colour icon, shown by the Plasma widget in "Add Widgets":
+install -Dm644 assets/logo.svg ~/.local/share/icons/hicolor/scalable/apps/sound-cast.svg
 systemctl --user daemon-reload
 systemctl --user enable --now sound-cast
 ```
