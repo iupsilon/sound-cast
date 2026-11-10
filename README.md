@@ -8,9 +8,19 @@ its audio plays in that room. Nothing is cast while nothing plays.
 
 ![The sound-cast Plasma widget](docs/widget.png)
 
-*The [Plasma widget](https://github.com/iupsilon/plasma-applet-sound-cast) is
-optional: any PipeWire mixer (pavucontrol, the Plasma volume applet, GNOME
-Settings) can route audio to the sinks.*
+*The sound-cast Plasma widget, playing on a Google Home speaker.*
+
+## The two parts
+
+sound-cast comes in two repositories. Install the daemon first.
+
+| Part | Repository | What it does | Needed |
+|---|---|---|---|
+| **Daemon** | [iupsilon/sound-cast](https://github.com/iupsilon/sound-cast) (this one) | Finds the Chromecasts, creates one PipeWire sink per room and streams the audio to them. | Yes |
+| **Plasma widget** | [iupsilon/plasma-applet-sound-cast](https://github.com/iupsilon/plasma-applet-sound-cast) | KDE Plasma 6 panel and system tray widget: status of every room, one-click output switching, service on/off, event log. | No |
+
+Without the widget, any PipeWire mixer (pavucontrol, the Plasma volume applet,
+GNOME Settings) can route audio to the sinks.
 
 ## Features
 
