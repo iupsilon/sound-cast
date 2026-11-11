@@ -1,7 +1,8 @@
 # .deb, .rpm and Arch packages, built by packaging/package.sh.
-# VERSION comes from the environment (the version in Cargo.toml).
+# VERSION (the version in Cargo.toml) and NFPM_ARCH (amd64 or arm64) come from
+# the environment.
 name: sound-cast
-arch: amd64
+arch: ${NFPM_ARCH}
 platform: linux
 version: ${VERSION}
 release: 1

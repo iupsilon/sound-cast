@@ -8,17 +8,23 @@
 //! - method `Resume(s sink_name)`: take back a device another sender took.
 //! - method `Stop(s sink_name)`: end now a session that is only waiting out
 //!   its grace period (no audio on the sink).
+//! - method `Start(s sink_name)`: open a session now, without waiting for audio.
+//! - method `SetVolume(s sink_name, d level)`: 0.0 to 1.0, on the slider scale.
+//! - method `SetMute(s sink_name, b muted)`.
+//! - method `Rescan()`: ask every device on the network to answer again.
+//! - property `Version` (s): the daemon version.
 //!
 //! Both properties announce their changes with `PropertiesChanged`, at most
 //! every [`COALESCE`]. Times are Unix seconds; `now` in `Status` lets a client
 //! correct for its own clock.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -26,6 +32,8 @@ use zbus::interface;
 use zbus::zvariant::Value as Variant;
 
 use crate::Event;
+use crate::discovery::Device;
+use crate::mpris::Track;
 
 pub const BUS_NAME: &str = "org.soundcast.Daemon";
 pub const PATH: &str = "/org/soundcast/Daemon";
@@ -100,6 +108,10 @@ impl Phase {
 struct Room {
     name: String,
     sink_name: String,
+    model: String,
+    screen: bool,
+    group: bool,
+    fixed: bool,
     phase: Phase,
     reason: String,
     since: f64,
@@ -111,6 +123,14 @@ struct Room {
     buffering: VecDeque<f64>,
     /// 0 to 100, as the device last had it.
     volume: Option<(u32, bool)>,
+    /// When the last stream client connected: position 0 of its stream.
+    stream_started: Option<Instant>,
+    /// The latency reported to PipeWire, in milliseconds.
+    latency_ms: Option<u64>,
+    /// What plays on the sink, as its media player tells.
+    track: Option<Track>,
+    /// The local file of the track's cover, served to the device.
+    art: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -118,6 +138,8 @@ struct Inner {
     port: u16,
     rooms: BTreeMap<String, Room>,
     events: VecDeque<Value>,
+    /// The number of the next event: it grows by one, whatever the clock does.
+    next_seq: u64,
 }
 
 pub struct Shared {
@@ -156,12 +178,16 @@ impl Shared {
         }
     }
 
-    pub fn add_room(&self, key: &str, name: &str, sink_name: &str) {
+    pub fn add_room(&self, device: &Device, sink_name: &str) {
         self.inner.lock().unwrap().rooms.insert(
-            key.to_string(),
+            device.key.clone(),
             Room {
-                name: name.to_string(),
+                name: device.name.clone(),
                 sink_name: sink_name.to_string(),
+                model: device.model.clone(),
+                screen: device.screen,
+                group: device.group,
+                fixed: device.fixed,
                 phase: Phase::Ready,
                 reason: String::new(),
                 since: unix_now(),
@@ -170,6 +196,10 @@ impl Shared {
                 listeners: 0,
                 buffering: VecDeque::new(),
                 volume: None,
+                stream_started: None,
+                latency_ms: None,
+                track: None,
+                art: None,
             },
         );
         self.changed(true, false);
@@ -239,9 +269,63 @@ impl Shared {
     /// Counts an HTTP client of the room's stream coming (+1) or going (-1).
     pub fn listener(&self, key: &str, delta: isize) {
         if let Some(room) = self.inner.lock().unwrap().rooms.get_mut(key) {
+            // The stream starts with the first client after a load, or after all
+            // clients left: a second connection (a probe, another client) is not
+            // where the device's position counts from.
+            if delta > 0 && (room.stream_started.is_none() || room.listeners == 0) {
+                room.stream_started = Some(Instant::now());
+            }
             room.listeners = room.listeners.saturating_add_signed(delta);
         }
         self.changed(true, false);
+    }
+
+    /// When the stream the device plays started: its first client since the
+    /// last load.
+    pub fn stream_started(&self, key: &str) -> Option<Instant> {
+        self.inner.lock().unwrap().rooms.get(key).and_then(|r| r.stream_started)
+    }
+
+    /// A new load is on its way: the next client starts the stream anew.
+    pub fn reset_stream(&self, key: &str) {
+        if let Some(room) = self.inner.lock().unwrap().rooms.get_mut(key) {
+            room.stream_started = None;
+        }
+    }
+
+    pub fn set_latency(&self, key: &str, latency: Option<Duration>) {
+        let latency_ms = latency.map(|l| l.as_millis() as u64);
+        let mut inner = self.inner.lock().unwrap();
+        let Some(room) = inner.rooms.get_mut(key) else {
+            return;
+        };
+        if room.latency_ms == latency_ms {
+            return;
+        }
+        room.latency_ms = latency_ms;
+        drop(inner);
+        self.changed(true, false);
+    }
+
+    /// Sets what plays on the room's sink. A `file://` cover is remembered,
+    /// to be served to the device.
+    pub fn set_track(&self, key: &str, track: Option<Track>) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(room) = inner.rooms.get_mut(key) else {
+            return;
+        };
+        if room.track == track {
+            return;
+        }
+        room.art = track.as_ref().and_then(|t| t.art_file());
+        room.track = track;
+        drop(inner);
+        self.changed(true, false);
+    }
+
+    /// The cover file to serve for the room, if its track has a local one.
+    pub fn art(&self, key: &str) -> Option<PathBuf> {
+        self.inner.lock().unwrap().rooms.get(key).and_then(|r| r.art.clone())
     }
 
     pub fn listeners(&self, key: &str) -> usize {
@@ -260,7 +344,10 @@ impl Shared {
         if inner.events.len() == MAX_EVENTS {
             inner.events.pop_front();
         }
+        let seq = inner.next_seq;
+        inner.next_seq += 1;
         inner.events.push_back(json!({
+            "seq": seq,
             "ts": unix_now(),
             "level": level.as_str(),
             "code": code,
@@ -271,9 +358,11 @@ impl Shared {
         self.changed(false, true);
     }
 
-    /// `{"now", "port", "devices": [{"key", "friendly_name", "sink_name", "phase",
-    /// "reason", "since", "deadline", "lost_until", "listeners",
-    /// "buffering_last_minute", "volume", "muted"}]}`
+    /// `{"now", "port", "devices": [{"key", "friendly_name", "sink_name", "model",
+    /// "screen", "group", "fixed", "phase", "reason", "since", "deadline",
+    /// "lost_until", "listeners", "buffering_last_minute", "volume", "muted",
+    /// "latency_ms", "track"}]}`. `track` is null or `{"title", "artist",
+    /// "album", "art_url", "player", "playing"}`.
     pub fn status_json(&self) -> String {
         let now = unix_now();
         let mut inner = self.inner.lock().unwrap();
@@ -289,6 +378,10 @@ impl Shared {
                     "key": key,
                     "friendly_name": room.name,
                     "sink_name": room.sink_name,
+                    "model": room.model,
+                    "screen": room.screen,
+                    "group": room.group,
+                    "fixed": room.fixed,
                     "phase": room.phase.as_str(),
                     "reason": room.reason,
                     "since": room.since,
@@ -298,6 +391,8 @@ impl Shared {
                     "buffering_last_minute": room.buffering.len(),
                     "volume": room.volume.map(|v| v.0),
                     "muted": room.volume.map(|v| v.1),
+                    "latency_ms": room.latency_ms,
+                    "track": room.track.as_ref().map(Track::to_json),
                 })
             })
             .collect();
@@ -326,26 +421,56 @@ impl Daemon {
         self.shared.events_json()
     }
 
+    #[zbus(property)]
+    fn version(&self) -> String {
+        env!("CARGO_PKG_VERSION").to_string()
+    }
+
     /// Takes back a device another sender took, if the room has audio to play.
     fn resume(&self, sink_name: &str) -> zbus::fdo::Result<()> {
-        let key = self
-            .shared
-            .key_of_sink(sink_name)
-            .ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("no sink {sink_name}")))?;
-        self.events
-            .send(Event::Resume(key))
-            .map_err(|_| zbus::fdo::Error::Failed("shutting down".into()))
+        self.send(Event::Resume(self.key(sink_name)?))
     }
 
     /// Ends now a session that has no audio and waits out its grace period.
     fn stop(&self, sink_name: &str) -> zbus::fdo::Result<()> {
-        let key = self
-            .shared
+        self.send(Event::Stop(self.key(sink_name)?))
+    }
+
+    /// Opens a session now, before any audio: the device is ready when it comes.
+    /// Without audio, the session ends after the grace period.
+    fn start(&self, sink_name: &str) -> zbus::fdo::Result<()> {
+        self.send(Event::Start(self.key(sink_name)?))
+    }
+
+    /// Sets the volume of the sink, and so of the device. 0.0 to 1.0.
+    fn set_volume(&self, sink_name: &str, level: f64) -> zbus::fdo::Result<()> {
+        if !(0.0..=1.0).contains(&level) {
+            return Err(zbus::fdo::Error::InvalidArgs(format!("level {level} is not in 0..1")));
+        }
+        let key = self.key(sink_name)?;
+        self.send(Event::Volume { key, level: Some(level as f32), muted: None })
+    }
+
+    fn set_mute(&self, sink_name: &str, muted: bool) -> zbus::fdo::Result<()> {
+        let key = self.key(sink_name)?;
+        self.send(Event::Volume { key, level: None, muted: Some(muted) })
+    }
+
+    /// Asks every Cast device on the network to answer again.
+    fn rescan(&self) -> zbus::fdo::Result<()> {
+        self.send(Event::Rescan)
+    }
+}
+
+impl Daemon {
+    fn key(&self, sink_name: &str) -> zbus::fdo::Result<String> {
+        self.shared
             .key_of_sink(sink_name)
-            .ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("no sink {sink_name}")))?;
-        self.events
-            .send(Event::Stop(key))
-            .map_err(|_| zbus::fdo::Error::Failed("shutting down".into()))
+            .ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("no sink {sink_name}")))
+    }
+
+    fn send(&self, event: Event) -> zbus::fdo::Result<()> {
+        self.events.send(event).map_err(|_| zbus::fdo::Error::Failed("shutting down".into()))
     }
 }
 

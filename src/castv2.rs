@@ -144,7 +144,7 @@ impl Connection {
 }
 
 /// Encodes a `CastMessage` with a text payload.
-fn encode(source: &str, destination: &str, namespace: &str, payload: &str) -> Vec<u8> {
+pub(crate) fn encode(source: &str, destination: &str, namespace: &str, payload: &str) -> Vec<u8> {
     fn text(out: &mut Vec<u8>, field: u8, value: &str) {
         out.push(field << 3 | 2);
         let mut length = value.len();
@@ -165,7 +165,7 @@ fn encode(source: &str, destination: &str, namespace: &str, payload: &str) -> Ve
 }
 
 /// Decodes a `CastMessage`. Returns `None` when it has no JSON text payload.
-fn decode(mut bytes: &[u8]) -> Result<Option<Message>> {
+pub(crate) fn decode(mut bytes: &[u8]) -> Result<Option<Message>> {
     fn varint(bytes: &mut &[u8]) -> Result<u64> {
         let mut value = 0u64;
         for shift in (0..64).step_by(7) {

@@ -17,3 +17,6 @@ pipewire = "0.10.1"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = "1.0.154"
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["ring"] }

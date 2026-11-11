@@ -1,5 +1,7 @@
-//! Minimal HTTP server: one endless WAV stream per client at
-//! `/stream/<token>/<room>`, and the logo shown on screens at [`LOGO_PATH`].
+//! Minimal HTTP server: one endless WAV or FLAC stream per client at
+//! `/stream/<token>/<room>`, the logo shown on screens at [`LOGO_PATH`], and
+//! the cover of the track playing at `/art/<token>/<room>`, when the player
+//! gives it as a local file.
 //!
 //! The Cast devices fetch the stream without authentication, so the server
 //! listens on every interface. The room key is broadcast by mDNS: the token, a
@@ -8,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv6Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -16,6 +18,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use crate::Settings;
+use crate::flac;
 use crate::hub::{BYTES_PER_FRAME, CHANNELS, Hub, RATE};
 use crate::status::Shared;
 
@@ -29,6 +33,27 @@ const BUSY: &[u8] =
 /// Where the logo is served. It is public: it reveals nothing, so it needs no token.
 pub const LOGO_PATH: &str = "/logo.png";
 const LOGO: &[u8] = include_bytes!("../assets/logo.png");
+
+/// Where the cover of a room's track is served, before `/<token>/<room>`.
+pub const ART_PATH: &str = "/art";
+/// Largest cover file served.
+const MAX_ART: u64 = 8 * 1024 * 1024;
+
+/// The audio format of the streams.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Codec {
+    Wav,
+    Flac,
+}
+
+impl Codec {
+    pub fn content_type(self) -> &'static str {
+        match self {
+            Codec::Wav => "audio/wav",
+            Codec::Flac => "audio/flac",
+        }
+    }
+}
 
 /// Connections served at the same time. Each one holds a thread.
 const MAX_CLIENTS: usize = 32;
@@ -69,7 +94,64 @@ fn wav_header() -> [u8; 44] {
     h
 }
 
-fn handle(mut socket: TcpStream, hubs: &Hubs, shared: &Shared) -> std::io::Result<()> {
+/// The image type of a cover, from its first bytes.
+fn image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF8") {
+        Some("image/gif")
+    } else if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// The cover of the room's track, if it is a local image file.
+fn art(shared: &Shared, key: &str) -> Option<(Vec<u8>, &'static str)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = shared.art(key)?;
+    // The path comes from a media player. A FIFO or a device would block the
+    // open: only a regular file is opened, and never in a blocking way.
+    if !std::fs::metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(&path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_ART + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_ART {
+        return None;
+    }
+    let kind = image_type(&bytes)?;
+    Some((bytes, kind))
+}
+
+/// The room key of a `<prefix>/<token>/<room>` path with the right token.
+/// A query string is ignored.
+fn room_of<'a>(path: &'a str, prefix: &str, token: &str) -> Option<&'a str> {
+    let path = path.split_once('?').map_or(path, |(p, _)| p);
+    path.strip_prefix(prefix)?
+        .strip_prefix('/')?
+        .split_once('/')
+        .filter(|(t, _)| same_secret(t, token))
+        .map(|(_, key)| key)
+}
+
+fn handle(
+    mut socket: TcpStream,
+    hubs: &Hubs,
+    shared: &Shared,
+    codec: Codec,
+) -> std::io::Result<()> {
     socket.set_read_timeout(Some(Duration::from_secs(5)))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
     socket.set_nodelay(true)?;
@@ -100,12 +182,27 @@ fn handle(mut socket: TcpStream, hubs: &Hubs, shared: &Shared) -> std::io::Resul
         )?;
         return if method == "GET" { socket.write_all(LOGO) } else { Ok(()) };
     }
-    let key = path
-        .strip_prefix("/stream/")
-        .and_then(|rest| rest.split_once('/'))
-        .filter(|(token, _)| same_secret(token, &shared.token))
-        .map(|(_, key)| key)
-        .filter(|_| method == "GET" || method == "HEAD");
+    if (method == "GET" || method == "HEAD")
+        && let Some(key) = room_of(path, ART_PATH, &shared.token)
+    {
+        let Some((bytes, kind)) = art(shared, key) else {
+            return socket.write_all(NOT_FOUND);
+        };
+        socket.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: {kind}\r\n\
+                 Content-Length: {}\r\n\
+                 Cache-Control: max-age=3600\r\n\
+                 Connection: close\r\n\r\n",
+                bytes.len()
+            )
+            .as_bytes(),
+        )?;
+        return if method == "GET" { socket.write_all(&bytes) } else { Ok(()) };
+    }
+    let key =
+        room_of(path, "/stream", &shared.token).filter(|_| method == "GET" || method == "HEAD");
     let Some((key, hub)) = key.and_then(|k| Some((k, hubs.lock().unwrap().get(k).cloned()?)))
     else {
         return socket.write_all(NOT_FOUND);
@@ -117,34 +214,114 @@ fn handle(mut socket: TcpStream, hubs: &Hubs, shared: &Shared) -> std::io::Resul
         return socket.write_all(NOT_FOUND);
     }
     socket.write_all(
-        b"HTTP/1.1 200 OK\r\n\
-          Content-Type: audio/wav\r\n\
-          Cache-Control: no-store\r\n\
-          Connection: close\r\n\r\n",
+        format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: {}\r\n\
+             Cache-Control: no-store\r\n\
+             Connection: close\r\n\r\n",
+            codec.content_type()
+        )
+        .as_bytes(),
     )?;
     let Some(chunks) = chunks else {
         return Ok(());
     };
     shared.listener(key, 1);
-    let result = (|| {
-        socket.write_all(&wav_header())?;
-        for chunk in chunks {
-            socket.write_all(&chunk)?;
+    let result = (|| match codec {
+        Codec::Wav => {
+            socket.write_all(&wav_header())?;
+            for chunk in chunks {
+                socket.write_all(&chunk)?;
+            }
+            Ok(())
         }
-        Ok(())
+        Codec::Flac => {
+            socket.write_all(&flac::header())?;
+            let mut encoder = flac::Encoder::default();
+            let mut frames = Vec::new();
+            for chunk in chunks {
+                encoder.push(&chunk, &mut frames);
+                if !frames.is_empty() {
+                    socket.write_all(&frames)?;
+                    frames.clear();
+                }
+            }
+            Ok(())
+        }
     })();
     shared.listener(key, -1);
     result
 }
 
-/// Binds the port, then serves clients on a background thread each.
-pub fn start(port: u16, hubs: Hubs, shared: Arc<Shared>) -> Result<()> {
-    let listener =
-        TcpListener::bind(("0.0.0.0", port)).with_context(|| format!("bind TCP port {port}"))?;
+/// Whether an IPv6 socket takes IPv6 only (`IPV6_V6ONLY`). Unknown counts as yes.
+fn v6_only(listener: &TcpListener) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut value: libc::c_int = 1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: a valid socket, and a buffer of the size given.
+    let result = unsafe {
+        libc::getsockopt(
+            listener.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            (&raw mut value).cast(),
+            &mut len,
+        )
+    };
+    result != 0 || value != 0
+}
+
+/// Binds the port, then serves clients on a background thread each. The IPv6
+/// socket takes IPv4 too, unless the system makes IPv6 sockets IPv6-only
+/// (`net.ipv6.bindv6only`): then a second socket takes IPv4. Without IPv6 on
+/// the host, IPv4 only.
+pub fn start(settings: Arc<Settings>, hubs: Hubs, shared: Arc<Shared>) -> Result<()> {
+    let (port, codec) = (settings.port, settings.codec);
+    let mut listeners = Vec::new();
+    match TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)) {
+        Ok(v6) => {
+            // A dual-stack IPv6 socket already takes IPv4: then the bind fails
+            // with "address in use", and that is no conflict.
+            let dual_stack = !v6_only(&v6);
+            listeners.push(v6);
+            match TcpListener::bind(("0.0.0.0", port)) {
+                Ok(v4) => listeners.push(v4),
+                Err(error) if dual_stack && error.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(error) => eprintln!("http: IPv4 port {port}: {error}; IPv6 only"),
+            }
+        }
+        Err(_) => listeners.push(
+            TcpListener::bind(("0.0.0.0", port))
+                .with_context(|| format!("bind TCP port {port}"))?,
+        ),
+    }
     let clients = Arc::new(AtomicUsize::new(0));
+    for listener in listeners {
+        serve(listener, hubs.clone(), shared.clone(), clients.clone(), codec);
+    }
+    Ok(())
+}
+
+/// Accepts the clients of one listening socket, on a background thread.
+fn serve(
+    listener: TcpListener,
+    hubs: Hubs,
+    shared: Arc<Shared>,
+    clients: Arc<AtomicUsize>,
+    codec: Codec,
+) {
     thread::spawn(move || {
         for mut socket in listener.incoming().flatten() {
-            let peer = socket.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+            // An IPv4 client on the IPv6 socket shows as ::ffff:a.b.c.d.
+            let peer = socket
+                .peer_addr()
+                .map(|a| match a.ip() {
+                    std::net::IpAddr::V6(v6) => {
+                        v6.to_ipv4_mapped().map_or(v6.to_string(), |v4| v4.to_string())
+                    }
+                    ip => ip.to_string(),
+                })
+                .unwrap_or_default();
             if clients.fetch_add(1, Ordering::AcqRel) >= MAX_CLIENTS {
                 clients.fetch_sub(1, Ordering::AcqRel);
                 eprintln!("http: {peer} refused, {MAX_CLIENTS} clients already");
@@ -157,7 +334,7 @@ pub fn start(port: u16, hubs: Hubs, shared: Arc<Shared>) -> Result<()> {
             let clients = clients.clone();
             thread::spawn(move || {
                 eprintln!("http: {peer} connected");
-                match handle(socket, &hubs, &shared) {
+                match handle(socket, &hubs, &shared, codec) {
                     Ok(()) => eprintln!("http: {peer} closed"),
                     Err(error) => eprintln!("http: {peer} closed ({error})"),
                 }
@@ -165,7 +342,6 @@ pub fn start(port: u16, hubs: Hubs, shared: Arc<Shared>) -> Result<()> {
             });
         }
     });
-    Ok(())
 }
 
 #[cfg(test)]
@@ -173,11 +349,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn v6_only_follows_the_system() {
+        let Ok(listener) = TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0)) else { return };
+        let Ok(system) = std::fs::read_to_string("/proc/sys/net/ipv6/bindv6only") else { return };
+        assert_eq!(v6_only(&listener), system.trim() == "1");
+    }
+
+    #[test]
     fn tokens_are_random_hex() {
         let (a, b) = (new_token().unwrap(), new_token().unwrap());
         assert_eq!(a.len(), 32);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn paths_need_the_token() {
+        assert_eq!(room_of("/stream/abc/sala", "/stream", "abc"), Some("sala"));
+        assert_eq!(room_of("/art/abc/sala?v=3", ART_PATH, "abc"), Some("sala"));
+        assert_eq!(room_of("/stream/abd/sala", "/stream", "abc"), None);
+        assert_eq!(room_of("/streamx/abc/sala", "/stream", "abc"), None);
+        assert_eq!(room_of("/stream/abc", "/stream", "abc"), None);
+    }
+
+    #[test]
+    fn image_types() {
+        assert_eq!(image_type(b"\x89PNG\r\n"), Some("image/png"));
+        assert_eq!(image_type(&[0xff, 0xd8, 0xff, 0xe0]), Some("image/jpeg"));
+        assert_eq!(image_type(b"<svg"), None);
     }
 
     #[test]

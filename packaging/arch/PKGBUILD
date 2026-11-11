@@ -3,7 +3,7 @@ pkgname=sound-cast
 pkgver=0.1.1
 pkgrel=1
 pkgdesc="Plays desktop audio on Chromecast speakers, one PipeWire sink per room"
-arch=(x86_64)
+arch=(x86_64 aarch64)
 url="https://github.com/iupsilon/sound-cast"
 license=(GPL-3.0-or-later)
 depends=(gcc-libs glibc libpipewire pipewire)
@@ -23,9 +23,13 @@ build() {
   cd sound-cast
   # The package may go to other machines: no code tuned for this CPU (CachyOS
   # sets -march=native and target-cpu=native).
-  CFLAGS=${CFLAGS//-march=native/-march=x86-64}; CFLAGS=${CFLAGS//-mtune=native/-mtune=generic}
-  CXXFLAGS=${CXXFLAGS//-march=native/-march=x86-64}; CXXFLAGS=${CXXFLAGS//-mtune=native/-mtune=generic}
-  RUSTFLAGS=${RUSTFLAGS//target-cpu=native/target-cpu=x86-64}
+  local base=x86-64
+  [[ $CARCH == aarch64 ]] && base=armv8-a
+  local cpu=$base
+  [[ $CARCH == aarch64 ]] && cpu=generic
+  CFLAGS=${CFLAGS//-march=native/-march=$base}; CFLAGS=${CFLAGS//-mtune=native/-mtune=generic}
+  CXXFLAGS=${CXXFLAGS//-march=native/-march=$base}; CXXFLAGS=${CXXFLAGS//-mtune=native/-mtune=generic}
+  RUSTFLAGS=${RUSTFLAGS//target-cpu=native/target-cpu=$cpu}
   export CFLAGS CXXFLAGS RUSTFLAGS
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
