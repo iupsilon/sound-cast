@@ -86,6 +86,12 @@ cd packaging/arch && makepkg -si
 The same `PKGBUILD` and its `.SRCINFO` are what the AUR package `sound-cast` is
 made of, for AUR helpers: `paru -S sound-cast` once it is published.
 
+To try your own checkout before a release, `packaging/install-local.sh` builds
+the daemon and, from `../plasma-applet-sound-cast` (or the directory you pass),
+the Plasma widget with the same `PKGBUILD`s, from the files on disk instead of
+the release tag. The packages land in `dist/local/`; then it installs them with
+`pacman`, restarts the service and Plasma. `--build-only` stops after the build.
+
 Then start the service for your user, and enable it at login:
 
 ```sh

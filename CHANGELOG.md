@@ -6,6 +6,8 @@ All notable changes to sound-cast. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-11
+
 ### Added
 
 - Audio/video sync: the delay of each device is measured during playback and
@@ -33,6 +35,8 @@ All notable changes to sound-cast. The format follows
   x86-64 and ARM64.
 - Events carry a `seq` number that grows by one, whatever the clock does.
 - An integration test against a fake Cast receiver.
+- `packaging/install-local.sh` builds and installs the daemon and the Plasma widget
+  from local checkouts, on Arch.
 
 ### Changed
 
@@ -63,6 +67,7 @@ First public release.
 - `--port`, `--only`, `--no-cast` and `--version` options.
 - Packages for Arch Linux, Debian/Ubuntu and Fedora, built on every tag.
 
-[Unreleased]: https://github.com/iupsilon/sound-cast/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/iupsilon/sound-cast/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/iupsilon/sound-cast/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/iupsilon/sound-cast/releases/tag/v0.1.1
 [0.1.0]: https://github.com/iupsilon/sound-cast/releases/tag/v0.1.0
