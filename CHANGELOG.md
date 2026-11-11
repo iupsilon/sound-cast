@@ -39,7 +39,7 @@ All notable changes to sound-cast. The format follows
 - Two devices with the same name get the sinks `sound-cast.name` and
   `sound-cast.name.2`, instead of a part of the device id.
 - The stream server also listens on IPv4 when the system makes IPv6 sockets
-  IPv6-only; another program on the IPv4 port stops it at startup.
+  IPv6-only; another program on the port, IPv6 or IPv4, stops it at startup.
 - The release is published once, with the packages of both architectures.
 
 ## [0.1.1] - 2026-11-10

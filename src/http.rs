@@ -296,6 +296,11 @@ pub fn start(settings: Arc<Settings>, hubs: Hubs, shared: Arc<Shared>) -> Result
                 Err(error) => eprintln!("http: IPv4 port {port}: {error}; IPv6 only"),
             }
         }
+        // Another program on the port, for IPv6 or for IPv4 on a dual-stack host.
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            return Err(error).with_context(|| format!("bind TCP port {port}"));
+        }
+        // No IPv6 on the host.
         Err(_) => listeners.push(
             TcpListener::bind(("0.0.0.0", port))
                 .with_context(|| format!("bind TCP port {port}"))?,
