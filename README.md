@@ -168,8 +168,10 @@ systemctl --user edit sound-cast
   stereo, 16 bit) at `http://<host>:<port>/stream/<token>/<room>`. The token is a
   random secret drawn at startup, so other hosts on the LAN cannot guess the
   URL. Nothing is written to disk. The server listens on IPv6 and IPv4. Another
-  program on the port stops the daemon at startup, on either; a host without
-  IPv4 gets a line in the log and the server stays IPv6 only.
+  program on the port stops the daemon at startup, on either. When the extra
+  IPv4 socket cannot be opened for another reason (a host without IPv4), the
+  log says why and the server carries on with the IPv6 socket; a host without
+  IPv6 is served on IPv4 only.
 - **Cast**: when a sink receives audio, the daemon starts the default media
   receiver on the device and loads the stream. After 20 s without audio it stops
   the receiver. If another sender takes the device, the daemon yields until its
