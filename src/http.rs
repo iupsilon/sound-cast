@@ -281,12 +281,18 @@ pub fn start(settings: Arc<Settings>, hubs: Hubs, shared: Arc<Shared>) -> Result
     match TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)) {
         Ok(v6) => {
             // A dual-stack IPv6 socket already takes IPv4: then the bind fails
-            // with "address in use", and that is no conflict.
+            // with "address in use", and that is no conflict. On an IPv6-only
+            // socket it is another program on the port, and most devices could
+            // not fetch the stream: an error, as without IPv6.
             let dual_stack = !v6_only(&v6);
             listeners.push(v6);
             match TcpListener::bind(("0.0.0.0", port)) {
                 Ok(v4) => listeners.push(v4),
-                Err(error) if dual_stack && error.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    if !dual_stack {
+                        return Err(error).with_context(|| format!("bind TCP port {port} (IPv4)"));
+                    }
+                }
                 Err(error) => eprintln!("http: IPv4 port {port}: {error}; IPv6 only"),
             }
         }
