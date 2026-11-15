@@ -3,18 +3,18 @@ pkgbase = sound-cast
 	pkgver = 0.2.0
 	pkgrel = 1
 	url = https://github.com/iupsilon/sound-cast
+	install = sound-cast.install
 	arch = x86_64
 	arch = aarch64
 	license = GPL-3.0-or-later
 	makedepends = cargo
 	makedepends = clang
-	makedepends = git
 	depends = gcc-libs
 	depends = glibc
 	depends = libpipewire
 	depends = pipewire
 	options = !lto
-	source = git+https://github.com/iupsilon/sound-cast.git#tag=v0.2.0
-	sha256sums = SKIP
+	source = sound-cast-0.2.0.tar.gz::https://github.com/iupsilon/sound-cast/archive/v0.2.0.tar.gz
+	sha256sums = f64a252bf6974f2582bc08714dcd3c01785d99b89ab026b84c96d3c8318a8594
 
 pkgname = sound-cast

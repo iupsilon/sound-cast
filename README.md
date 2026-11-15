@@ -83,7 +83,7 @@ On Arch you can also build the package from source with the `PKGBUILD` in
 cd packaging/arch && makepkg -si
 ```
 
-The same `PKGBUILD` and its `.SRCINFO` are what the AUR package `sound-cast` is
+The same `PKGBUILD`, its `.SRCINFO` and `sound-cast.install` are what the AUR package `sound-cast` is
 made of, for AUR helpers: `paru -S sound-cast` once it is published.
 
 To try your own checkout before a release, `packaging/install-local.sh` builds
@@ -304,13 +304,14 @@ on every push. For a tag it also publishes a GitHub release with the packages.
 
 The workflow checks that the tag matches `Cargo.toml`, builds the packages and
 publishes the release with the notes from the changelog. For Arch, update
-`pkgver` in `packaging/arch/PKGBUILD` and regenerate the `.SRCINFO`:
+`pkgver` in `packaging/arch/PKGBUILD` (and set `pkgrel=1`), then, once the tag
+is on GitHub, update the tarball checksum and regenerate the `.SRCINFO`:
 
 ```sh
-cd packaging/arch && makepkg --printsrcinfo > .SRCINFO
+cd packaging/arch && updpkgsums && makepkg --printsrcinfo > .SRCINFO && rm -f sound-cast-*.tar.gz
 ```
 
-To publish on the AUR, copy `PKGBUILD` and `.SRCINFO` into a clone of
+To publish on the AUR, copy `PKGBUILD`, `.SRCINFO` and `sound-cast.install` into a clone of
 `ssh://aur@aur.archlinux.org/sound-cast.git`, commit and push.
 
 ## Limitations

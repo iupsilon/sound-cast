@@ -1,0 +1,16 @@
+post_install() {
+  cat <<'EOF'
+==> Start sound-cast for your user, and at every login:
+      systemctl --user enable --now sound-cast
+==> The Cast devices fetch the audio on TCP port 8574: allow it from the LAN
+    in your firewall, for example:
+      sudo ufw allow 8574/tcp
+EOF
+}
+
+post_upgrade() {
+  cat <<'EOF'
+==> Restart sound-cast to run the new version:
+      systemctl --user restart sound-cast
+EOF
+}

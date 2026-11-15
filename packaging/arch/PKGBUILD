@@ -7,37 +7,35 @@ arch=(x86_64 aarch64)
 url="https://github.com/iupsilon/sound-cast"
 license=(GPL-3.0-or-later)
 depends=(gcc-libs glibc libpipewire pipewire)
-makedepends=(cargo clang git)
-source=("git+$url.git#tag=v$pkgver")
-sha256sums=(SKIP)
+makedepends=(cargo clang)
+install=sound-cast.install
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('f64a252bf6974f2582bc08714dcd3c01785d99b89ab026b84c96d3c8318a8594')
 # GCC LTO objects from ring's C code cannot be linked by rustc's linker.
 options=(!lto)
 
 prepare() {
-  cd sound-cast
+  cd "$pkgname-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-  cd sound-cast
-  # The package may go to other machines: no code tuned for this CPU (CachyOS
-  # sets -march=native and target-cpu=native).
-  local base=x86-64
-  [[ $CARCH == aarch64 ]] && base=armv8-a
-  local cpu=$base
-  [[ $CARCH == aarch64 ]] && cpu=generic
-  CFLAGS=${CFLAGS//-march=native/-march=$base}; CFLAGS=${CFLAGS//-mtune=native/-mtune=generic}
-  CXXFLAGS=${CXXFLAGS//-march=native/-march=$base}; CXXFLAGS=${CXXFLAGS//-mtune=native/-mtune=generic}
-  RUSTFLAGS=${RUSTFLAGS//target-cpu=native/target-cpu=$cpu}
-  export CFLAGS CXXFLAGS RUSTFLAGS
+  cd "$pkgname-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release
 }
 
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release
+}
+
 package() {
-  cd sound-cast
+  cd "$pkgname-$pkgver"
   install -Dm755 target/release/sound-cast "$pkgdir/usr/bin/sound-cast"
   # The unit in the repository runs a cargo install; the package installs to /usr/bin.
   sed 's|^ExecStart=.*|ExecStart=/usr/bin/sound-cast|; /^# Installed with/d' sound-cast.service \

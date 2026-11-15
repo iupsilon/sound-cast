@@ -10,7 +10,7 @@
 # service restarts and the widget is reloaded with plasmashell.
 #
 # Arch and derivatives only (makepkg, pacman). Needs the PKGBUILDs' build
-# dependencies: cargo, clang, git, gettext, make.
+# dependencies: cargo, clang, git, gettext, make (git also makes the tarballs).
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 
@@ -26,21 +26,23 @@ rm -rf "$out"
 mkdir -p "$out"
 
 # Builds the PKGBUILD of a checkout from a tarball of its files instead of the
-# git tag it names. $1: checkout, $2: the directory the PKGBUILD works in.
+# release it names. $1: checkout, $2: the directory the PKGBUILD works in.
 build() {
     local repo=$1 name=$2 work
     work=$(mktemp -d)
     # Tracked files plus new ones not ignored, as they are on disk now.
     (cd "$repo" && git ls-files -z --cached --others --exclude-standard) \
         | (cd "$repo" && tar --null -T - --transform "s|^|$name/|" -cf "$work/$name.tar")
-    sed -e "s|^source=.*|source=(\"$name.tar\")|" \
+    # The .install file and any other file next to the PKGBUILD.
+    cp -r "$repo/packaging/arch/." "$work/"
+    sed -e "s|^source=.*|source=(\"$name.tar\")|" -e "s|^sha256sums=.*|sha256sums=(SKIP)|" \
         "$repo/packaging/arch/PKGBUILD" > "$work/PKGBUILD"
     (cd "$work" && PKGDEST=$out makepkg --force --cleanbuild --noconfirm)
     rm -rf "$work"
 }
 
 echo "== sound-cast"
-build "$here" sound-cast
+build "$here" "sound-cast-$(sed -n 's/^pkgver=//p' "$here/packaging/arch/PKGBUILD")"
 if [[ -f $widget/packaging/arch/PKGBUILD ]]; then
     echo "== Plasma widget"
     build "$(cd "$widget" && pwd)" plasma-applet-sound-cast
