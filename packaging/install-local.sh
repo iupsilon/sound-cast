@@ -45,7 +45,8 @@ echo "== sound-cast"
 build "$here" "sound-cast-$(sed -n 's/^pkgver=//p' "$here/packaging/arch/PKGBUILD")"
 if [[ -f $widget/packaging/arch/PKGBUILD ]]; then
     echo "== Plasma widget"
-    build "$(cd "$widget" && pwd)" plasma-applet-sound-cast
+    build "$(cd "$widget" && pwd)" \
+        "plasma-applet-sound-cast-$(sed -n 's/^pkgver=//p' "$widget/packaging/arch/PKGBUILD")"
 else
     echo "== no widget checkout at $widget: skipped"
 fi
