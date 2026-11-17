@@ -12,6 +12,13 @@ All notable changes to sound-cast. The format follows
   device starts in a fraction of a second and plays about 2.5 s late instead of
   about 8.8 s: with less it ran out of audio at once and buffered about 7 s.
 
+### Fixed
+
+- `--codec flac` stalled on the devices, for seconds and up to about 25 s, at
+  the start and whenever the audio fell silent. Silence is no longer coded as
+  constant subframes or with Rice parameter 0 (a run of `0xff` bytes), and the
+  opening silence goes out uncompressed. Silence now costs about 190 kbit/s.
+
 ## [0.2.0] - 2026-11-11
 
 ### Added

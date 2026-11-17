@@ -247,7 +247,8 @@ fn handle(
             socket.write_all(&flac::header())?;
             let mut encoder = flac::Encoder::default();
             let mut frames = Vec::new();
-            encoder.push(&silence(prefill), &mut frames);
+            // Verbatim: the device counts its buffer in bytes.
+            encoder.push_verbatim(&silence(prefill), &mut frames);
             for chunk in chunks {
                 encoder.push(&chunk, &mut frames);
                 if !frames.is_empty() {

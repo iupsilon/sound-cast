@@ -5,7 +5,18 @@
 //! with the best of the fixed predictors (orders 0 to 4) and partitioned Rice
 //! residuals; the stereo pair is coded as left/right, left/side, side/right or
 //! mid/side, whichever is smallest. That is FLAC's "fast" level: about half the
-//! size of WAV for music, next to nothing for silence, and cheap on the CPU.
+//! size of WAV for music, and cheap on the CPU.
+//!
+//! Cast devices stall on what FLAC does best with silence, and then buffer for
+//! seconds before they play again:
+//! - constant subframes, a few bytes a second;
+//! - Rice parameter 0, where a zero residual is a run of `0xff` bytes.
+//!
+//! So no subframe is constant and every Rice parameter is at least
+//! [`MIN_RICE`]: silence costs two bits a sample (about 190 kbit/s, an eighth
+//! of WAV). A device also fills its starting buffer by bytes, not by time, so
+//! the opening silence of a stream goes out verbatim
+//! ([`Encoder::push_verbatim`]), as large as WAV.
 
 use crate::hub::{CHANNELS, RATE};
 
@@ -22,6 +33,8 @@ const MAX_ORDER: usize = 4;
 const MAX_PARTITION_ORDER: u32 = 6;
 /// Largest Rice parameter with the 4-bit parameter field (15 means escape).
 const MAX_RICE: u32 = 14;
+/// Smallest Rice parameter used: with 0, a zero residual is all one bits.
+const MIN_RICE: u32 = 1;
 
 /// The stream header: the `fLaC` marker and a STREAMINFO block.
 pub fn header() -> Vec<u8> {
@@ -50,9 +63,18 @@ pub struct Encoder {
     frame_number: u64,
     /// The bytes of a PCM frame split between two pushes.
     partial: Vec<u8>,
+    /// Code the blocks completed now verbatim, as large as WAV.
+    verbatim: bool,
 }
 
 impl Encoder {
+    /// Like [`Encoder::push`], but the blocks completed are not compressed.
+    pub fn push_verbatim(&mut self, pcm: &[u8], out: &mut Vec<u8>) {
+        self.verbatim = true;
+        self.push(pcm, out);
+        self.verbatim = false;
+    }
+
     /// Takes PCM and appends the frames it completes to `out`.
     pub fn push(&mut self, pcm: &[u8], out: &mut Vec<u8>) {
         let joined;
@@ -80,10 +102,11 @@ impl Encoder {
         let (left, right) = (&self.left, &self.right);
         let mid: Vec<i32> = left.iter().zip(right).map(|(l, r)| (l + r) >> 1).collect();
         let side: Vec<i32> = left.iter().zip(right).map(|(l, r)| l - r).collect();
-        let l = Subframe::best(left, BITS);
-        let r = Subframe::best(right, BITS);
-        let m = Subframe::best(&mid, BITS);
-        let s = Subframe::best(&side, BITS + 1);
+        let v = self.verbatim;
+        let l = Subframe::best(left, BITS, v);
+        let r = Subframe::best(right, BITS, v);
+        let m = Subframe::best(&mid, BITS, v);
+        let s = Subframe::best(&side, BITS + 1, v);
         // Channel assignment: 1 left/right, 8 left/side, 9 side/right, 10 mid/side.
         let choices = [
             (0b0001, &l, &r, l.bits + r.bits),
@@ -128,25 +151,25 @@ struct Subframe<'a> {
 }
 
 enum Kind {
-    Constant,
     Verbatim,
     Fixed { order: usize, residual: Vec<i64>, partition_order: u32, parameters: Vec<u32> },
 }
 
 impl<'a> Subframe<'a> {
-    /// The smallest coding of `samples`.
-    fn best(samples: &'a [i32], bits_per_sample: u32) -> Self {
+    /// The smallest coding of `samples`, constant subframes left out, or the
+    /// verbatim one.
+    fn best(samples: &'a [i32], bits_per_sample: u32, verbatim: bool) -> Self {
         let header = 8;
         let bps = u64::from(bits_per_sample);
-        if samples.iter().all(|s| *s == samples[0]) {
-            return Self { samples, bits_per_sample, kind: Kind::Constant, bits: header + bps };
-        }
         let mut best = Self {
             samples,
             bits_per_sample,
             kind: Kind::Verbatim,
             bits: header + bps * samples.len() as u64,
         };
+        if verbatim {
+            return best;
+        }
         for order in 0..=MAX_ORDER {
             let residual = fixed_residual(samples, order);
             let (partition_order, parameters, residual_bits) = rice_partitions(&residual, order);
@@ -166,10 +189,6 @@ impl<'a> Subframe<'a> {
     fn write(&self, out: &mut BitWriter) {
         let bps = self.bits_per_sample;
         match &self.kind {
-            Kind::Constant => {
-                out.put(0b0000_0000, 8);
-                out.put_signed(self.samples[0].into(), bps);
-            }
             Kind::Verbatim => {
                 out.put(0b0000_0010, 8);
                 for sample in self.samples {
@@ -253,7 +272,7 @@ fn best_rice(values: &[u64]) -> (u32, u64) {
     let mean = sum / values.len().max(1) as u64;
     // The optimum is near log2 of the mean: try around it.
     let guess = (u64::BITS - mean.leading_zeros()).min(MAX_RICE);
-    (guess.saturating_sub(2)..=(guess + 1).min(MAX_RICE))
+    (guess.saturating_sub(2).max(MIN_RICE)..=(guess + 1).clamp(MIN_RICE, MAX_RICE))
         .map(|k| (k, size(k)))
         .min_by_key(|(_, bits)| *bits)
         .unwrap()
@@ -413,11 +432,24 @@ mod tests {
     fn silence_and_music_compress() {
         let mut encoder = Encoder::default();
         let mut out = Vec::new();
+        // Two bits a sample, not a constant subframe that starves the device.
         encoder.push(&pcm(BLOCK, |_| (0, 0)), &mut out);
-        assert!(out.len() < 32, "silence took {} bytes", out.len());
+        let floor = BLOCK * 2 * 2 / 8;
+        assert!((floor..floor + 32).contains(&out.len()), "silence took {} bytes", out.len());
         out.clear();
         encoder.push(&pcm(BLOCK, music), &mut out);
         assert!(out.len() < BLOCK * 4 * 6 / 10, "music took {} bytes", out.len());
+    }
+
+    #[test]
+    fn verbatim_blocks_are_as_large_as_wav() {
+        let mut encoder = Encoder::default();
+        let mut out = Vec::new();
+        encoder.push_verbatim(&pcm(BLOCK, |_| (0, 0)), &mut out);
+        assert!(out.len() > BLOCK * 4, "verbatim silence took {} bytes", out.len());
+        out.clear();
+        encoder.push(&pcm(BLOCK, |_| (0, 0)), &mut out);
+        assert!(out.len() < BLOCK, "silence after it took {} bytes", out.len());
     }
 
     /// Decodes with the reference `flac` tool when it is installed.
@@ -435,7 +467,9 @@ mod tests {
         });
         let mut stream = header();
         let mut encoder = Encoder::default();
-        encoder.push(&input, &mut stream);
+        // The first block verbatim, as a stream opens.
+        encoder.push_verbatim(&input[..BLOCK * 4], &mut stream);
+        encoder.push(&input[BLOCK * 4..], &mut stream);
         let path =
             std::env::temp_dir().join(format!("sound-cast-test-{}.flac", std::process::id()));
         std::fs::write(&path, &stream).unwrap();
