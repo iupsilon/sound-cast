@@ -34,7 +34,8 @@ GNOME Settings) can route audio to the sinks.
 - Now playing: the title, artist and cover of the app's media player (MPRIS) show on
   devices with a screen and in the status.
 - Pause, play and stop on the device (or in the Google Home app) pause and resume
-  the player on the desktop.
+  the player on the desktop. A pause or stop on the desktop player (MPRIS) stops
+  the device within about a second, without playing out its buffer.
 - WAV or FLAC streams (`--codec flac`: about half the bandwidth, still lossless).
 - Yields to another app (YouTube, Spotify) that takes the device, and can take it back.
 - Devices mDNS cannot find, given by address (`--device`); rooms renamed
@@ -148,10 +149,11 @@ sound-cast --device Studio=192.168.1.40 --codec flac
   they keep the picture in sync with the room. `auto` (default) measures it on the
   device, `off` reports none, a number reports that many milliseconds.
 - `--prefill MS`: the silence sent ahead of the audio when a device connects
-  (default 2500). A device that starts with a short buffer runs out of audio at
+  (default 3000). A device that starts with a short buffer runs out of audio at
   once and buffers about 7 s before it plays again, and the room then stays about
   8.8 s late. With the prefill it starts in a fraction of a second and plays
-  about 2.5 s late. Below 2000 the device stalls; `0` sends none.
+  about 3 s late. Below 2000 the device stalls at the start, and below 3000 when
+  the stream is loaded again on a running session; `0` sends none.
 - `--live-metadata`: load the stream again when the track changes, so a screen
   shows the new title and cover. Each change costs a gap of a second or two;
   without it the screen shows the track that played when the session started.

@@ -9,6 +9,8 @@
 //! the device is passed to the same player.
 //!
 //! Players are polled every [`POLL`], and only while some sink has a source.
+//! A player that announces a change (a pause, a new track) is looked at at
+//! once: a pause must reach the room before the device plays out its buffer.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,7 +20,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use zbus::blocking::Connection;
+use zbus::blocking::{Connection, MessageIterator};
 use zbus::blocking::fdo::DBusProxy;
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::OwnedValue;
@@ -68,6 +70,8 @@ pub enum Command {
     Play {
         key: String,
     },
+    /// A player announced that its properties changed.
+    Changed,
 }
 
 /// What plays on a sink.
@@ -229,7 +233,37 @@ pub fn start(shared: Arc<Shared>) -> Sender<Command> {
     let (tx, rx) = channel();
     let watcher = Watcher { shared, rooms: HashMap::new(), bus: None, bus_failed: false };
     thread::spawn(move || watcher.run(rx));
+    let changes = tx.clone();
+    thread::spawn(move || listen(changes));
     tx
+}
+
+/// Wakes the watcher whenever a player announces a change. Without the
+/// signals the players are still polled.
+fn listen(changes: Sender<Command>) {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.DBus.Properties")
+        .and_then(|r| r.member("PropertiesChanged"))
+        .and_then(|r| r.path(OBJECT))
+        .and_then(|r| r.add_arg(PLAYER))
+        .map(|r| r.build());
+    let iter = rule.and_then(|rule| {
+        let bus = Connection::session()?;
+        MessageIterator::for_match_rule(rule, &bus, Some(64))
+    });
+    let iter = match iter {
+        Ok(iter) => iter,
+        Err(error) => {
+            eprintln!("mpris: player signals: {error}; polling only");
+            return;
+        }
+    };
+    for message in iter {
+        if message.is_ok() && changes.send(Command::Changed).is_err() {
+            return;
+        }
+    }
 }
 
 impl Watcher {
@@ -280,6 +314,7 @@ impl Watcher {
                 self.call(&key, "Play");
                 false
             }
+            Command::Changed => true,
         }
     }
 

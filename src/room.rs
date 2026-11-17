@@ -78,6 +78,8 @@ const RELOAD_DEBOUNCE: Duration = Duration::from_millis(1500);
 pub enum Control {
     /// The sink started or stopped receiving audio.
     Active(bool),
+    /// The sink has had no sound for a quarter of a second, or has sound again.
+    Quiet(bool),
     /// The sink volume changed. `level` is on the slider scale, 1.0 is 100%.
     Volume { level: f32, muted: bool },
     /// Discovery saw the device again, maybe at a new address.
@@ -188,6 +190,11 @@ pub struct Room {
     last_position_query: Instant,
     /// Set when the device paused the stream by itself (the user did, there).
     paused_on_device: Option<Instant>,
+    /// The sink has had no sound for a quarter of a second.
+    quiet: bool,
+    /// The player paused or stopped on the desktop: once the sink is quiet,
+    /// a fresh stream drops the audio the device still holds.
+    paused_on_desktop: bool,
 }
 
 impl Room {
@@ -234,6 +241,8 @@ impl Room {
             latency: None,
             last_position_query: Instant::now(),
             paused_on_device: None,
+            quiet: false,
+            paused_on_desktop: false,
         }
     }
 
@@ -388,7 +397,16 @@ impl Room {
                     self.yielded = false;
                 }
             }
+            Control::Quiet(quiet) => self.quiet = quiet,
             Control::Track(track) => {
+                let was_playing = self.track.as_ref().is_some_and(|t| t.playing);
+                let playing = track.as_ref().is_some_and(|t| t.playing);
+                // Not a pause the device made: that one it already holds.
+                if was_playing && !playing && self.paused_on_device.is_none() {
+                    self.paused_on_desktop = true;
+                } else if playing {
+                    self.paused_on_desktop = false;
+                }
                 self.track = track;
                 if self.settings.live_metadata {
                     self.reload_at = Some(Instant::now() + RELOAD_DEBOUNCE);
@@ -610,6 +628,7 @@ impl Room {
         self.stop_requested = false;
         self.reload_at = None;
         self.restart_stream = false;
+        self.paused_on_desktop = false;
         self.reload_pending = None;
         self.replaced_media = None;
         self.retry_reload = false;
@@ -687,6 +706,18 @@ impl Room {
                 bail!("the reloaded stream did not start");
             }
             if let Phase::Playing { transport, session } = &phase {
+                // Paused on the desktop: the device would play out its buffer,
+                // about the prefill. The player may announce the pause before the
+                // last sound passed the sink, so the sink must be quiet too.
+                if self.paused_on_desktop
+                    && self.quiet
+                    && self.reload_pending.is_none()
+                    && self.paused_on_device.is_none()
+                {
+                    self.paused_on_desktop = false;
+                    self.log("paused on the desktop, dropping the audio the device still holds");
+                    self.restart_stream = true;
+                }
                 // Looked at only when a reload can go out: a change that comes while
                 // one is pending waits for it. Not while paused on the device: a
                 // reload would start the device again behind the user's back.

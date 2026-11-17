@@ -82,6 +82,8 @@ const MIN_GAIN: f32 = 1e-6;
 const SOUND_LEVEL: f32 = 1e-4;
 /// Silence for this many frames makes the sink inactive.
 const SILENCE_FRAMES: u64 = 3 * RATE as u64;
+/// Silence for this many frames (250 ms) makes the sink quiet.
+const QUIET_FRAMES: u64 = RATE as u64 / 4;
 /// How often the applications linked into each sink are looked at.
 const SOURCES_EVERY: Duration = Duration::from_secs(1);
 
@@ -98,6 +100,8 @@ struct Tap {
     muted: AtomicBool,
     /// True while sound arrives. Changes are sent as [`Control::Active`].
     sounding: AtomicBool,
+    /// True after [`QUIET_FRAMES`] of silence. Changes are sent as [`Control::Quiet`].
+    quiet: AtomicBool,
     /// Frames of silence since the last sound.
     silent_frames: AtomicU64,
 }
@@ -111,7 +115,14 @@ impl Tap {
             previous_gain: AtomicU32::new(1f32.to_bits()),
             muted: AtomicBool::new(false),
             sounding: AtomicBool::new(false),
+            quiet: AtomicBool::new(false),
             silent_frames: AtomicU64::new(0),
+        }
+    }
+
+    fn set_quiet(&self, quiet: bool) {
+        if self.quiet.swap(quiet, Ordering::Relaxed) != quiet {
+            let _ = self.control.send(Control::Quiet(quiet));
         }
     }
 
@@ -133,10 +144,14 @@ impl Tap {
             && samples.as_chunks::<4>().0.iter().any(|s| f32::from_le_bytes(*s).abs() > threshold);
         if loud {
             self.silent_frames.store(0, Ordering::Relaxed);
+            self.set_quiet(false);
             self.set_sounding(true);
         } else {
             let frames = (samples.len() / (4 * CHANNELS as usize)) as u64;
             let silent = self.silent_frames.fetch_add(frames, Ordering::Relaxed) + frames;
+            if silent >= QUIET_FRAMES {
+                self.set_quiet(true);
+            }
             if silent >= SILENCE_FRAMES {
                 self.set_sounding(false);
             }
@@ -491,6 +506,7 @@ fn create(core: &CoreRc, node_name: &str, description: &str, tap: Tap) -> Result
         .state_changed(|_, tap, _, new| {
             // Starting to stream is not enough: sound must arrive (see watch_level).
             if !matches!(new, StreamState::Streaming) {
+                tap.set_quiet(true);
                 tap.set_sounding(false);
             }
         })
@@ -615,6 +631,24 @@ mod tests {
 
         tap.muted.store(true, Ordering::Relaxed);
         tap.watch_level(&cycle(0.0, SILENCE_FRAMES as usize));
+        assert!(matches!(controls.try_recv(), Ok(Control::Quiet(true))));
         assert!(matches!(controls.try_recv(), Ok(Control::Active(false))));
+    }
+
+    #[test]
+    fn a_short_silence_makes_the_sink_quiet_not_inactive() {
+        let (_hub, captured) = crate::hub::Hub::start();
+        let (control, controls) = channel();
+        let tap = Tap::new(captured, control);
+
+        tap.watch_level(&cycle(0.5, 1024));
+        assert!(matches!(controls.try_recv(), Ok(Control::Active(true))));
+        tap.watch_level(&cycle(0.0, QUIET_FRAMES as usize - 1));
+        assert!(controls.try_recv().is_err());
+        tap.watch_level(&cycle(0.0, 1));
+        assert!(matches!(controls.try_recv(), Ok(Control::Quiet(true))));
+        tap.watch_level(&cycle(0.5, 1024));
+        assert!(matches!(controls.try_recv(), Ok(Control::Quiet(false))));
+        assert!(controls.try_recv().is_err());
     }
 }

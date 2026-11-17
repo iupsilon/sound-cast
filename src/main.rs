@@ -45,7 +45,7 @@ usage: sound-cast [OPTION]...
                        latency reported to applications for A/V sync (default auto:
                        measured on the device)
   --prefill MS         silence sent ahead of the audio when a device connects, so it
-                       starts with a full buffer (default 2500, 0 for none)
+                       starts with a full buffer (default 3000, 0 for none)
   --live-metadata      reload the stream on every track change, so screens show the
                        new title (costs a short gap)
   --no-cast            create the sinks and serve the streams, but never play on a device
@@ -92,7 +92,7 @@ impl Default for Settings {
             cast: true,
             codec: Codec::Wav,
             latency: Latency::Auto,
-            prefill: Duration::from_millis(2500),
+            prefill: Duration::from_millis(3000),
             live_metadata: false,
         }
     }

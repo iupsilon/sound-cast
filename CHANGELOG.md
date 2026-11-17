@@ -6,11 +6,20 @@ All notable changes to sound-cast. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A pause or stop on the desktop player stops the device within about a second.
+  It used to play out its buffer, about 3 s. The players' MPRIS signals are
+  followed as they come, no longer only polled every 2 s, and once the sink has
+  had no sound for 250 ms a fresh stream drops the audio the device holds.
+
 ### Changed
 
-- Every stream opens with 2.5 s of silence (`--prefill MS`, `0` for none). The
-  device starts in a fraction of a second and plays about 2.5 s late instead of
-  about 8.8 s: with less it ran out of audio at once and buffered about 7 s.
+- Every stream opens with 3 s of silence (`--prefill MS`, `0` for none). The
+  device starts in a fraction of a second and plays about 3 s late instead of
+  about 8.8 s: with less it ran out of audio at once and buffered about 7 s. A
+  stream loaded again on a running session needs more than a first one: 2.5 s
+  stalled it every time.
 
 ### Fixed
 

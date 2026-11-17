@@ -262,7 +262,7 @@ fn a_session_plays_measures_latency_follows_pauses_and_stops() {
     assert_eq!(status["volume"], 40, "the device leads the volume at the start");
     // The fake plays 0.3 s behind what it fetched, and the prefill ahead of that.
     let latency = status["latency_ms"].as_u64().expect("a latency");
-    assert!((2750..4000).contains(&latency), "latency {latency} ms");
+    assert!((3250..4500).contains(&latency), "latency {latency} ms");
     assert_eq!(status["listeners"], 1);
     {
         let log = s.fake.log.lock().unwrap();
@@ -323,6 +323,35 @@ fn live_metadata_reloads_once_per_song() {
     s.control.send(Control::Track(None)).unwrap();
     s.control.send(Control::Track(Some(song("One", "https://example.com/1.png")))).unwrap();
     thread::sleep(Duration::from_millis(2500));
+    assert_eq!(loads(&s.fake), 2);
+    assert_eq!(device_status(&s.shared)["phase"], "playing");
+    assert!(s.players.try_recv().is_err(), "the player was told something");
+}
+
+#[test]
+fn a_pause_on_the_desktop_drops_the_audio_the_device_holds() {
+    let s = setup(Settings::default());
+    s.control.send(Control::Active(true)).unwrap();
+    eventually("playing", Duration::from_secs(10), || {
+        device_status(&s.shared)["phase"] == "playing"
+    });
+    let radio =
+        |playing| Some(mpris::Track { title: "Radio".into(), playing, ..Default::default() });
+    s.control.send(Control::Track(radio(true))).unwrap();
+    // Paused, but the last sound has not passed the sink yet: no reload.
+    s.control.send(Control::Track(radio(false))).unwrap();
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(loads(&s.fake), 1);
+    // The sink is quiet: one reload, and only one.
+    s.control.send(Control::Quiet(true)).unwrap();
+    eventually("reload", Duration::from_secs(5), || loads(&s.fake) == 2);
+    thread::sleep(Duration::from_millis(1000));
+    assert_eq!(loads(&s.fake), 2);
+    // Playing again, then a quiet gap between songs: no reload.
+    s.control.send(Control::Track(radio(true))).unwrap();
+    s.control.send(Control::Quiet(false)).unwrap();
+    s.control.send(Control::Quiet(true)).unwrap();
+    thread::sleep(Duration::from_millis(1000));
     assert_eq!(loads(&s.fake), 2);
     assert_eq!(device_status(&s.shared)["phase"], "playing");
     assert!(s.players.try_recv().is_err(), "the player was told something");
