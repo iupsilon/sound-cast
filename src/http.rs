@@ -76,6 +76,12 @@ fn same_secret(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// PCM silence as long as `duration`.
+fn silence(duration: Duration) -> Vec<u8> {
+    let frames = duration.as_millis() as usize * RATE as usize / 1000;
+    vec![0; frames * BYTES_PER_FRAME as usize]
+}
+
 /// WAV header for a stream of unknown length.
 fn wav_header() -> [u8; 44] {
     let mut h = [0u8; 44];
@@ -151,6 +157,7 @@ fn handle(
     hubs: &Hubs,
     shared: &Shared,
     codec: Codec,
+    prefill: Duration,
 ) -> std::io::Result<()> {
     socket.set_read_timeout(Some(Duration::from_secs(5)))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -230,6 +237,7 @@ fn handle(
     let result = (|| match codec {
         Codec::Wav => {
             socket.write_all(&wav_header())?;
+            socket.write_all(&silence(prefill))?;
             for chunk in chunks {
                 socket.write_all(&chunk)?;
             }
@@ -239,6 +247,7 @@ fn handle(
             socket.write_all(&flac::header())?;
             let mut encoder = flac::Encoder::default();
             let mut frames = Vec::new();
+            encoder.push(&silence(prefill), &mut frames);
             for chunk in chunks {
                 encoder.push(&chunk, &mut frames);
                 if !frames.is_empty() {
@@ -276,7 +285,7 @@ fn v6_only(listener: &TcpListener) -> bool {
 /// (`net.ipv6.bindv6only`): then a second socket takes IPv4. Without IPv6 on
 /// the host, IPv4 only.
 pub fn start(settings: Arc<Settings>, hubs: Hubs, shared: Arc<Shared>) -> Result<()> {
-    let (port, codec) = (settings.port, settings.codec);
+    let (port, codec, prefill) = (settings.port, settings.codec, settings.prefill);
     let mut listeners = Vec::new();
     match TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)) {
         Ok(v6) => {
@@ -308,7 +317,7 @@ pub fn start(settings: Arc<Settings>, hubs: Hubs, shared: Arc<Shared>) -> Result
     }
     let clients = Arc::new(AtomicUsize::new(0));
     for listener in listeners {
-        serve(listener, hubs.clone(), shared.clone(), clients.clone(), codec);
+        serve(listener, hubs.clone(), shared.clone(), clients.clone(), codec, prefill);
     }
     Ok(())
 }
@@ -320,6 +329,7 @@ fn serve(
     shared: Arc<Shared>,
     clients: Arc<AtomicUsize>,
     codec: Codec,
+    prefill: Duration,
 ) {
     thread::spawn(move || {
         for mut socket in listener.incoming().flatten() {
@@ -345,7 +355,7 @@ fn serve(
             let clients = clients.clone();
             thread::spawn(move || {
                 eprintln!("http: {peer} connected");
-                match handle(socket, &hubs, &shared, codec) {
+                match handle(socket, &hubs, &shared, codec, prefill) {
                     Ok(()) => eprintln!("http: {peer} closed"),
                     Err(error) => eprintln!("http: {peer} closed ({error})"),
                 }

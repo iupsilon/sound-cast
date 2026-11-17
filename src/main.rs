@@ -44,6 +44,8 @@ usage: sound-cast [OPTION]...
   --latency auto|off|MS
                        latency reported to applications for A/V sync (default auto:
                        measured on the device)
+  --prefill MS         silence sent ahead of the audio when a device connects, so it
+                       starts with a full buffer (default 2500, 0 for none)
   --live-metadata      reload the stream on every track change, so screens show the
                        new title (costs a short gap)
   --no-cast            create the sinks and serve the streams, but never play on a device
@@ -75,6 +77,10 @@ pub struct Settings {
     pub cast: bool,
     pub codec: Codec,
     pub latency: Latency,
+    /// Silence that opens every stream. A device that starts with less runs
+    /// out of audio within a second and buffers about 7 s before it plays
+    /// again, and that delay stays for the whole session.
+    pub prefill: Duration,
     pub live_metadata: bool,
 }
 
@@ -86,6 +92,7 @@ impl Default for Settings {
             cast: true,
             codec: Codec::Wav,
             latency: Latency::Auto,
+            prefill: Duration::from_millis(2500),
             live_metadata: false,
         }
     }
@@ -381,6 +388,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Options>> {
                     )),
                 }
             }
+            "--prefill" => {
+                let ms: u64 = value("milliseconds")?.parse().context("--prefill")?;
+                settings.prefill = Duration::from_millis(ms);
+            }
             "--live-metadata" => settings.live_metadata = true,
             "--no-cast" => settings.cast = false,
             "-V" | "--version" => {
@@ -522,7 +533,7 @@ mod unit_tests {
     fn options_parse() {
         let o = parse(args(
             "--port 9000 --grace 5 --codec flac --latency 1500 --exclude TV --alias Sala=Soggiorno \
-             --device Studio=10.0.0.9 --live-metadata",
+             --device Studio=10.0.0.9 --live-metadata --prefill 2000",
         ))
         .unwrap()
         .unwrap();
@@ -531,11 +542,13 @@ mod unit_tests {
         assert_eq!(o.settings.codec, Codec::Flac);
         assert_eq!(o.settings.latency, Latency::Fixed(Duration::from_millis(1500)));
         assert!(o.settings.live_metadata);
+        assert_eq!(o.settings.prefill, Duration::from_millis(2000));
         assert_eq!(o.fixed.len(), 1);
         assert_eq!(o.filter.aliases["sala"], "Soggiorno");
         assert!(parse(args("--codec mp3")).is_err());
         assert!(parse(args("--alias Sala")).is_err());
         assert!(parse(args("--latency soon")).is_err());
+        assert!(parse(args("--prefill soon")).is_err());
         assert_eq!(parse(args("--latency off")).unwrap().unwrap().settings.latency, Latency::Off);
     }
 

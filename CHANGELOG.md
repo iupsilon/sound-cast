@@ -6,6 +6,12 @@ All notable changes to sound-cast. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Every stream opens with 2.5 s of silence (`--prefill MS`, `0` for none). The
+  device starts in a fraction of a second and plays about 2.5 s late instead of
+  about 8.8 s: with less it ran out of audio at once and buffered about 7 s.
+
 ## [0.2.0] - 2026-11-11
 
 ### Added

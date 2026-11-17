@@ -417,8 +417,9 @@ impl Room {
     }
 
     /// Takes a position the device reported. The stream started at position 0
-    /// when the device connected, and the hub keeps it in real time: what it
-    /// sent beyond the position is what the device holds back.
+    /// when the device connected, the prefill ahead of real time, and the hub
+    /// keeps it in real time: what it sent beyond the position is what the
+    /// device holds back.
     fn take_position(&mut self, seconds: f64) {
         if self.settings.latency != Latency::Auto || !seconds.is_finite() || seconds < 0.0 {
             return;
@@ -429,7 +430,8 @@ impl Room {
         let Ok(position) = Duration::try_from_secs_f64(seconds) else {
             return;
         };
-        let Some(latency) = started.elapsed().checked_sub(position) else {
+        let ahead = started.elapsed() + self.settings.prefill;
+        let Some(latency) = ahead.checked_sub(position) else {
             return;
         };
         if latency > LATENCY_MAX {

@@ -260,8 +260,9 @@ fn a_session_plays_measures_latency_follows_pauses_and_stops() {
 
     let status = device_status(&s.shared);
     assert_eq!(status["volume"], 40, "the device leads the volume at the start");
+    // The fake plays 0.3 s behind what it fetched, and the prefill ahead of that.
     let latency = status["latency_ms"].as_u64().expect("a latency");
-    assert!((250..1500).contains(&latency), "latency {latency} ms");
+    assert!((2750..4000).contains(&latency), "latency {latency} ms");
     assert_eq!(status["listeners"], 1);
     {
         let log = s.fake.log.lock().unwrap();
