@@ -1,6 +1,6 @@
 pkgbase = sound-cast
 	pkgdesc = Plays desktop audio on Chromecast speakers, one PipeWire sink per room
-	pkgver = 0.2.0
+	pkgver = 0.3.0
 	pkgrel = 1
 	url = https://github.com/iupsilon/sound-cast
 	install = sound-cast.install
@@ -14,7 +14,7 @@ pkgbase = sound-cast
 	depends = libpipewire
 	depends = pipewire
 	options = !lto
-	source = sound-cast-0.2.0.tar.gz::https://github.com/iupsilon/sound-cast/archive/v0.2.0.tar.gz
-	sha256sums = f64a252bf6974f2582bc08714dcd3c01785d99b89ab026b84c96d3c8318a8594
+	source = sound-cast-0.3.0.tar.gz::https://github.com/iupsilon/sound-cast/archive/v0.3.0.tar.gz
+	sha256sums = 95fedce19b3aeef0a4224a52cd10c572850828f6cd53855e33397738feca12a1
 
 pkgname = sound-cast
